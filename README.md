@@ -66,7 +66,17 @@ Download prebuilt archives for macOS, Linux, and Windows from [GitHub Releases](
 
 ## Quick start
 
-### 1. Configure your API key
+### 1. Configure your API key or Application Default Credentials
+
+`gemini-api` resolves credentials in the following order:
+
+1. **CLI flags:** `--api-key` or `--access-token`
+2. **Environment variables:** `GEMINI_API_KEY` or `GEMINI_ACCESS_TOKEN`
+3. **OS keychain:** macOS Keychain, Linux Secret Service, or Windows Credential Manager (via `gemini-api configure` or `gemini-api auth login`)
+4. **Config file:** `~/.config/gemini-api/config.yaml`
+5. **Application Default Credentials (ADC):** `GOOGLE_APPLICATION_CREDENTIALS` or `~/.config/gcloud/application_default_credentials.json` (`$CLOUDSDK_CONFIG/application_default_credentials.json` / `%APPDATA%\gcloud\application_default_credentials.json` on Windows)
+
+#### Option A: Gemini API key
 
 Create an API key in Google AI Studio (see the [Gemini API key docs](https://ai.google.dev/gemini-api/docs/api-key)) and make it available to your shell or your agent's subprocess environment:
 
@@ -76,9 +86,23 @@ export GEMINI_API_KEY="YOUR_API_KEY"
 
 > **Workstation tip:** To persist your key in your OS keychain (macOS Keychain, Linux Secret Service, or Windows Credential Manager) or `~/.config/gemini-api/config.yaml`, run `gemini-api configure --api-key "YOUR_API_KEY"` or open the interactive form with `gemini-api configure --interactive`. Check your active configuration and credential source at any time with `gemini-api whoami`.
 
-Verify your setup locally with `--dry-run` (no network call), then remove `--dry-run` to call the API:
+#### Option B: Google Cloud Application Default Credentials (ADC)
+
+If no explicit API key or access token is configured, `gemini-api` automatically falls back to Google Cloud Application Default Credentials (supporting both `authorized_user` and `service_account` credentials) and sends an `Authorization: Bearer <token>` header.
+
+When authenticating user credentials via `gcloud`, include the `generative-language` subscopes alongside `cloud-platform` so the token is authorized for `generativelanguage.googleapis.com` and per-user quota:
 
 ```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/generative-language.retriever,https://www.googleapis.com/auth/generative-language.tuning,https://www.googleapis.com/auth/generative-language.peruserquota
+```
+
+> **Why these specific scopes?** Google's OAuth token endpoint rejects the umbrella `https://www.googleapis.com/auth/generative-language` scope with `invalid_scope` during `gcloud auth application-default login`, whereas requesting the three granular scopes (`generative-language.retriever`, `generative-language.tuning`, and `generative-language.peruserquota`) together with `cloud-platform` succeeds. When using a service account key via `GOOGLE_APPLICATION_CREDENTIALS`, `gemini-api` automatically requests these four scopes when minting the OAuth2 bearer token.
+
+Verify your active credential source (`[adc]` when using Application Default Credentials) and test your setup locally with `--dry-run` (no network call), then remove `--dry-run` to call the API:
+
+```bash
+gemini-api whoami
 gemini-api generate "Hello from my agent" --dry-run
 gemini-api generate "Hello from my agent"
 ```

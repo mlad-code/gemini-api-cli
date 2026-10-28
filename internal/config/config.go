@@ -137,6 +137,7 @@ func Reset() {
 	envPrefix = ""
 	initErr = nil
 	initialized = false
+	resetADCState()
 }
 
 // GetString returns a configuration value with priority: env var > config file.
@@ -215,8 +216,8 @@ func ResolveCredential(cmd *cobra.Command, flagName string, hasSchemaDefault boo
 }
 
 // ResolveSecurityCredential resolves a security credential using the priority chain:
-// flag > env var > OS keychain > config file.
-// Returns the value and its source ("flag", "env", "keyring", "config", or "unset").
+// flag > env var > OS keychain > config file > Application Default Credentials (ADC).
+// Returns the value and its source ("flag", "env", "keyring", "config", "adc", or "unset").
 // This is used for security fields (tokens, API keys, passwords). For global
 // parameters, use ResolveCredential which skips the keyring tier.
 func ResolveSecurityCredential(cmd *cobra.Command, flagName string) (value, source string) {
@@ -228,6 +229,11 @@ func ResolveSecurityCredential(cmd *cobra.Command, flagName string) (value, sour
 	}
 	if val := GetConfigValue(flagName); val != "" {
 		return val, "config"
+	}
+	if flagName == "access-token" && HasADC() && !hasHigherPriorityAPIKey(cmd, true) {
+		if val := ResolveADCAccessToken(); val != "" {
+			return val, "adc"
+		}
 	}
 	return "", "unset"
 }
@@ -244,7 +250,8 @@ func ResolveExplicitSecurityCredential(cmd *cobra.Command, flagName string) (val
 	return "", "unset"
 }
 
-// ResolveRequestSecurityCredential skips the OS keychain on --dry-run (keychain reads can prompt).
+// ResolveRequestSecurityCredential skips the OS keychain and ADC network
+// token exchange on --dry-run (keychain reads can prompt and dry-run is offline).
 func ResolveRequestSecurityCredential(cmd *cobra.Command, flagName string) (value, source string) {
 	if val, source := ResolveExplicitSecurityCredential(cmd, flagName); val != "" {
 		return val, source
@@ -258,10 +265,28 @@ func ResolveRequestSecurityCredential(cmd *cobra.Command, flagName string) (valu
 	if val := GetConfigValue(flagName); val != "" {
 		return val, "config"
 	}
+	if !dryRun && flagName == "access-token" && HasADC() && !hasHigherPriorityAPIKey(cmd, !dryRun) {
+		if val := ResolveADCAccessToken(); val != "" {
+			return val, "adc"
+		}
+	}
 	return "", "unset"
 }
 
-const credentialRankUnset = 4
+func hasHigherPriorityAPIKey(cmd *cobra.Command, allowKeyring bool) bool {
+	if val, _ := ResolveExplicitSecurityCredential(cmd, "api-key"); val != "" {
+		return true
+	}
+	if GetConfigValue("api-key") != "" {
+		return true
+	}
+	if allowKeyring && GetKeyringValue("api-key") != "" {
+		return true
+	}
+	return false
+}
+
+const credentialRankUnset = 5
 
 // CredentialSourceRank ranks a credential source; lower is more explicit and unset ranks last.
 func CredentialSourceRank(source string) int {
@@ -274,6 +299,8 @@ func CredentialSourceRank(source string) int {
 		return 2
 	case "config":
 		return 3
+	case "adc":
+		return 4
 	}
 	return credentialRankUnset
 }

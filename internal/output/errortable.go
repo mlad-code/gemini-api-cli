@@ -40,6 +40,7 @@ var errorProbes = []errorProbe{
 				Type: ErrorType("authorization_error"),
 				Hints: []string{
 					"The access token lacks the scope this call needs (https://www.googleapis.com/auth/generative-language). Re-authorize with that scope, or use an API key via GEMINI_API_KEY",
+					"For Google Cloud Application Default Credentials (ADC), run: gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/generative-language.retriever,https://www.googleapis.com/auth/generative-language.tuning,https://www.googleapis.com/auth/generative-language.peruserquota",
 				},
 			},
 			"ACCESS_TOKEN_TYPE_UNSUPPORTED": {
