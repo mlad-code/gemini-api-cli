@@ -561,24 +561,27 @@ func runCLIWithStdin(t *testing.T, home string, env map[string]string, stdin str
 
 func isolatedEnv(home string, overrides map[string]string) []string {
 	blocked := map[string]bool{
-		"HOME":                true,
-		"USERPROFILE":         true,
-		"GEMINI_API_KEY":      true,
-		"GEMINI_ACCESS_TOKEN": true,
-		"GEMINI_API_VERSION":  true,
-		"GEMINI_USER_PROJECT": true,
-		"CLAUDECODE":          true,
-		"CLAUDE_CODE":         true,
-		"CURSOR_AGENT":        true,
-		"CODEX":               true,
-		"AIDER":               true,
-		"CLINE":               true,
-		"WINDSURF_AGENT":      true,
-		"GITHUB_COPILOT":      true,
-		"AMAZON_Q":            true,
-		"GEMINI_CODE_ASSIST":  true,
-		"SRC_CODY":            true,
-		"FORCE_AGENT_MODE":    true,
+		"HOME":                           true,
+		"USERPROFILE":                    true,
+		"APPDATA":                        true,
+		"GOOGLE_APPLICATION_CREDENTIALS": true,
+		"CLOUDSDK_CONFIG":                true,
+		"GEMINI_API_KEY":                 true,
+		"GEMINI_ACCESS_TOKEN":            true,
+		"GEMINI_API_VERSION":             true,
+		"GEMINI_USER_PROJECT":            true,
+		"CLAUDECODE":                     true,
+		"CLAUDE_CODE":                    true,
+		"CURSOR_AGENT":                   true,
+		"CODEX":                          true,
+		"AIDER":                          true,
+		"CLINE":                          true,
+		"WINDSURF_AGENT":                 true,
+		"GITHUB_COPILOT":                 true,
+		"AMAZON_Q":                       true,
+		"GEMINI_CODE_ASSIST":             true,
+		"SRC_CODY":                       true,
+		"FORCE_AGENT_MODE":               true,
 	}
 	for key := range overrides {
 		blocked[key] = true
@@ -895,6 +898,63 @@ func TestAuthenticationHeadersAndPrecedence(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestApplicationDefaultCredentialsFallback(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"adc-bearer-token","expires_in":3600,"token_type":"Bearer"}`)
+	}))
+	defer tokenServer.Close()
+
+	headers := make(chan http.Header, 1)
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"agents":[]}`)
+	}))
+	defer apiServer.Close()
+
+	home := t.TempDir()
+	gcloudDir := filepath.Join(home, ".config", "gcloud")
+	if err := os.MkdirAll(gcloudDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	adcJSON := fmt.Sprintf(`{"type":"authorized_user","client_id":"cid","client_secret":"csec","refresh_token":"rtok","token_uri":%q}`, tokenServer.URL)
+	if err := os.WriteFile(filepath.Join(gcloudDir, "application_default_credentials.json"), []byte(adcJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without explicit --api-key or --access-token, ADC supplies Authorization: Bearer.
+	args := []string{
+		"--server-url", apiServer.URL,
+		"--api-version", "v1beta",
+		"--no-interactive",
+		"--no-keyring",
+		"--output-format", "json",
+		"--color", "never",
+		"agent", "list",
+	}
+	result := runCLI(t, home, nil, args...)
+	if result.err != nil {
+		t.Fatalf("agent list with ADC failed: %v\nstderr: %s", result.err, result.stderr)
+	}
+	reqHeaders := <-headers
+	if got := reqHeaders.Get("Authorization"); got != "Bearer adc-bearer-token" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer adc-bearer-token")
+	}
+	if got := reqHeaders.Get("x-goog-api-key"); got != "" {
+		t.Errorf("x-goog-api-key = %q, want empty when using ADC", got)
+	}
+
+	// whoami reports source "adc" for --access-token.
+	whoamiRes := runCLI(t, home, nil, "--no-keyring", "--output-format", "json", "whoami")
+	if whoamiRes.err != nil {
+		t.Fatalf("whoami with ADC failed: %v\nstderr: %s", whoamiRes.err, whoamiRes.stderr)
+	}
+	if !strings.Contains(whoamiRes.stdout, `"source":"adc"`) && !strings.Contains(whoamiRes.stdout, `"source": "adc"`) {
+		t.Errorf("whoami output missing ADC source:\n%s", whoamiRes.stdout)
 	}
 }
 

@@ -76,5 +76,5 @@ func credentialMissing(c *cobra.Command) bool {
 			return false
 		}
 	}
-	return true
+	return !config.HasADC()
 }
