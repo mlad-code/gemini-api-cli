@@ -88,10 +88,10 @@ type cachedADCToken struct {
 }
 
 var (
-	adcMu           sync.Mutex
-	adcCache        cachedADCToken
-	adcTokenURI     = defaultGoogleTokenURI
-	adcHTTPClient   = &http.Client{Timeout: 10 * time.Second}
+	adcMu         sync.Mutex
+	adcCache      cachedADCToken
+	adcTokenURI   = defaultGoogleTokenURI
+	adcHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
 
 func resetADCState() {

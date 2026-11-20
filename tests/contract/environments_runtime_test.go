@@ -21,7 +21,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -37,7 +39,7 @@ func TestEnvironmentsRuntimeHelpAndUsage(t *testing.T) {
 			args: []string{"environments", "connect"},
 			wantText: []string{
 				"Defaults: root-dir . · workdir . · max-concurrent 4 · poll-interval 2s",
-				"Learn: https://ai.google.dev/gemini-api/docs/agent-environment · escalate: multi-tenant orchestration via gemini-api environments poll",
+				"Learn: https://aistudio.google.com/docs/agent-environment · escalate: multi-tenant orchestration via gemini-api environments poll",
 				"--disable-bash",
 				"By default, stdout is unused",
 			},
@@ -47,7 +49,7 @@ func TestEnvironmentsRuntimeHelpAndUsage(t *testing.T) {
 			args: []string{"environments", "poll"},
 			wantText: []string{
 				"Defaults: max-interactions 10 · poll-interval 2s · provision-timeout 2m · handoff-heartbeat-interval 5s",
-				"Learn: https://ai.google.dev/gemini-api/docs/agent-environment · escalate: single-node execution via gemini-api environments connect",
+				"Learn: https://aistudio.google.com/docs/agent-environment · escalate: single-node execution via gemini-api environments connect",
 				"By default, stdout is unused",
 			},
 		},
@@ -56,7 +58,7 @@ func TestEnvironmentsRuntimeHelpAndUsage(t *testing.T) {
 			args: []string{"environments", "serve"},
 			wantText: []string{
 				"Defaults: root-dir . · workdir . · heartbeat-interval 5s · command-timeout 2m",
-				"Learn: https://ai.google.dev/gemini-api/docs/agent-environment · escalate: single-node polling + worker via gemini-api environments connect",
+				"Learn: https://aistudio.google.com/docs/agent-environment · escalate: single-node polling + worker via gemini-api environments connect",
 				"--disable-bash",
 				"By default, stdout is unused",
 			},
@@ -83,7 +85,7 @@ func TestEnvironmentsRuntimeHelpAndUsage(t *testing.T) {
 				"--api-key string",
 				"Tier-1",
 				"Tier-2",
-				"https://ai.google.dev/gemini-api/docs/environments",
+				"https://aistudio.google.com/docs/environments",
 			} {
 				if strings.Contains(helpRes.stdout, reject) {
 					t.Errorf("%v --help leaked forbidden text %q:\n%s", tc.args, reject, helpRes.stdout)
@@ -114,24 +116,28 @@ func TestEnvironmentsRuntimeDryRun(t *testing.T) {
 	absentWork := filepath.Join(absentRoot, "uncreated-work")
 
 	tests := []struct {
-		name     string
-		args     []string
-		wantPath string
+		name       string
+		args       []string
+		wantMethod string
+		wantPath   string
 	}{
 		{
-			name:     "connect",
-			args:     []string{"environments", "connect", "--root-dir", absentRoot, "--workdir", absentWork},
-			wantPath: "/v1beta/environments:leaseInteractions",
+			name:       "connect",
+			args:       []string{"environments", "connect", "--root-dir", absentRoot, "--workdir", absentWork},
+			wantMethod: "POST",
+			wantPath:   "/v1beta/environments:leaseInteractions",
 		},
 		{
-			name:     "poll",
-			args:     []string{"environments", "poll"},
-			wantPath: "/v1beta/environments:leaseInteractions",
+			name:       "poll",
+			args:       []string{"environments", "poll"},
+			wantMethod: "POST",
+			wantPath:   "/v1beta/environments:leaseInteractions",
 		},
 		{
-			name:     "serve",
-			args:     []string{"environments", "serve", "--root-dir", absentRoot, "--workdir", absentWork},
-			wantPath: "/google.learning.gemini.api.interactions.v1beta.InteractionsService/CreateInteractionBidiStreamByEnvironmentKey",
+			name:       "serve",
+			args:       []string{"environments", "serve", "--root-dir", absentRoot, "--workdir", absentWork},
+			wantMethod: "GET",
+			wantPath:   "/v1beta/interactions:streamForEnvironmentRuntime",
 		},
 	}
 
@@ -152,8 +158,9 @@ func TestEnvironmentsRuntimeDryRun(t *testing.T) {
 			if humanRes.stdout != "" {
 				t.Errorf("human dry-run stdout = %q, want empty", humanRes.stdout)
 			}
-			if !strings.Contains(humanRes.stderr, "[DRY-RUN] Would send: POST ") || !strings.Contains(humanRes.stderr, tc.wantPath) {
-				t.Errorf("human dry-run stderr = %q, want POST %s preview", humanRes.stderr, tc.wantPath)
+			wantDryPrefix := "[DRY-RUN] Would send: " + tc.wantMethod + " "
+			if !strings.Contains(humanRes.stderr, wantDryPrefix) || !strings.Contains(humanRes.stderr, tc.wantPath) {
+				t.Errorf("human dry-run stderr = %q, want %s%s preview", humanRes.stderr, wantDryPrefix, tc.wantPath)
 			}
 
 			jsonArgs := append(append([]string{}, humanArgs...), "--output-format", "json")
@@ -162,6 +169,9 @@ func TestEnvironmentsRuntimeDryRun(t *testing.T) {
 				t.Fatalf("runCLI(%v --dry-run -o json) failed: %v\nstderr: %s", tc.args, jsonRes.err, jsonRes.stderr)
 			}
 			reqPreview := parseDryRunRequest(t, jsonRes.stdout)
+			if gotMethod := fmt.Sprint(reqPreview["method"]); gotMethod != tc.wantMethod {
+				t.Errorf("json dry-run method = %q, want %q", gotMethod, tc.wantMethod)
+			}
 			gotURL := fmt.Sprint(reqPreview["url"])
 			if !strings.HasSuffix(gotURL, tc.wantPath) {
 				t.Errorf("json dry-run url = %q, want suffix %q", gotURL, tc.wantPath)
@@ -234,15 +244,16 @@ func TestEnvironmentsRuntimeExitCodesAndErrorTaxonomy(t *testing.T) {
 		},
 	}
 
+	noKeyringEnv := map[string]string{"GEMINI_NO_KEYRING": "true"}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			plainRes := runCLI(t, t.TempDir(), nil, tc.args...)
+			plainRes := runCLI(t, t.TempDir(), noKeyringEnv, tc.args...)
 			if got := exitCode(t, plainRes); got != tc.wantCode {
 				t.Errorf("runCLI(%v) exit code = %d, want %d\nstdout: %s\nstderr: %s", tc.args, got, tc.wantCode, plainRes.stdout, plainRes.stderr)
 			}
 
 			agentArgs := append([]string{"--agent-mode"}, tc.args...)
-			agentRes := runCLI(t, t.TempDir(), nil, agentArgs...)
+			agentRes := runCLI(t, t.TempDir(), noKeyringEnv, agentArgs...)
 			if got := exitCode(t, agentRes); got != tc.wantCode {
 				t.Errorf("runCLI(--agent-mode %v) exit code = %d, want %d\nstderr: %s", tc.args, got, tc.wantCode, agentRes.stderr)
 			}
@@ -325,5 +336,174 @@ func TestEnvironmentsRuntimeDualEnvCredentials(t *testing.T) {
 				t.Errorf("runCLI(%v) dry-run leaked raw secret in stdout: %s", cliArgs, res.stdout)
 			}
 		})
+	}
+}
+
+func TestEnvironmentsCreateAndConnect(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		createBody     map[string]any
+		createCalls    int
+		leaseEnvKeyHdr []string
+		leaseCalls     atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta/environments":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode create body: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			createCalls++
+			createBody = body
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"id":"env_1","mode":"self_hosted","environment_key":"ek_e2e_123"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta/environments:leaseInteractions":
+			hdr := r.Header.Get("x-goog-environment-key")
+			mu.Lock()
+			leaseEnvKeyHdr = append(leaseEnvKeyHdr, hdr)
+			mu.Unlock()
+			if leaseCalls.Add(1) == 1 {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, `{"leases":[]}`)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"error":{"code":404,"message":"environment gone"}}`)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	env := map[string]string{
+		"GEMINI_NO_KEYRING": "true",
+		"GEMINI_API_KEY":    "api_key_test",
+	}
+
+	// 1. Create a self-hosted environment and extract environment_key via --jq.
+	createArgs := append(baseArgs(server.URL),
+		"environments", "create",
+		"--mode", "self_hosted",
+		"--system-instruction", "Be concise.",
+		"--custom-config", `{"team":"a"}`,
+		"--jq", ".environment_key",
+	)
+	createRes := runCLI(t, t.TempDir(), env, createArgs...)
+	if createRes.err != nil {
+		t.Fatalf("environments create failed: %v\nstdout: %s\nstderr: %s", createRes.err, createRes.stdout, createRes.stderr)
+	}
+	mu.Lock()
+	gotCreateCalls := createCalls
+	gotCreateBody := createBody
+	mu.Unlock()
+	if gotCreateCalls != 1 {
+		t.Fatalf("POST /v1beta/environments calls = %d, want 1", gotCreateCalls)
+	}
+	envKey := strings.TrimSpace(createRes.stdout)
+	if envKey != "ek_e2e_123" {
+		t.Fatalf("create --jq .environment_key = %q, want %q", envKey, "ek_e2e_123")
+	}
+	if got := gotCreateBody["mode"]; got != "self_hosted" {
+		t.Errorf("create request body mode = %#v, want %q", got, "self_hosted")
+	}
+	if got := gotCreateBody["system_instruction"]; got != "Be concise." {
+		t.Errorf("create request body system_instruction = %#v, want %q", got, "Be concise.")
+	}
+	wantCustomConfig := map[string]any{"team": "a"}
+	if got := gotCreateBody["custom_config"]; !reflect.DeepEqual(got, wantCustomConfig) {
+		t.Errorf("create request body custom_config = %#v, want %#v", got, wantCustomConfig)
+	}
+
+	sandboxDir := t.TempDir()
+
+	// 2a. Verify dry-run connect carries x-goog-environment-key and redacts secrets.
+	dryRunArgs := append(baseArgs(server.URL),
+		"--dry-run",
+		"environments", "connect",
+		"--environment-key", envKey,
+		"--root-dir", sandboxDir,
+		"--workdir", sandboxDir,
+	)
+	dryRunRes := runCLI(t, t.TempDir(), env, dryRunArgs...)
+	if dryRunRes.err != nil {
+		t.Fatalf("environments connect --dry-run failed: %v\nstderr: %s", dryRunRes.err, dryRunRes.stderr)
+	}
+	if got := leaseCalls.Load(); got != 0 {
+		t.Fatalf("dry-run leaseInteractions call count = %d, want 0", got)
+	}
+	reqPreview := parseDryRunRequest(t, dryRunRes.stdout)
+	hdrs, _ := reqPreview["headers"].(map[string]any)
+	var gotPreviewEnvKey string
+	for k, v := range hdrs {
+		if strings.EqualFold(k, "x-goog-environment-key") {
+			gotPreviewEnvKey = fmt.Sprint(v)
+		}
+	}
+	if gotPreviewEnvKey == "" || !strings.Contains(gotPreviewEnvKey, "REDACTED") {
+		t.Errorf("dry-run x-goog-environment-key = %q (headers=%v), want redacted value", gotPreviewEnvKey, hdrs)
+	}
+	if strings.Contains(dryRunRes.stdout, envKey) || strings.Contains(dryRunRes.stderr, envKey) ||
+		strings.Contains(dryRunRes.stdout, "api_key_test") || strings.Contains(dryRunRes.stderr, "api_key_test") {
+		t.Errorf("dry-run leaked raw secret\nstdout: %s\nstderr: %s", dryRunRes.stdout, dryRunRes.stderr)
+	}
+
+	// 2b. Connect against the same server and verify x-goog-environment-key on every leaseInteractions call.
+	connectArgs := append(baseArgs(server.URL),
+		"environments", "connect",
+		"--environment-key", envKey,
+		"--root-dir", sandboxDir,
+		"--workdir", sandboxDir,
+		"--poll-interval", "10ms",
+	)
+	connectRes := runCLI(t, t.TempDir(), env, connectArgs...)
+	if got := exitCode(t, connectRes); got != 1 {
+		t.Errorf("environments connect exit code = %d, want 1 after 404 stop\nstdout: %s\nstderr: %s", got, connectRes.stdout, connectRes.stderr)
+	}
+	if got := leaseCalls.Load(); got != 2 {
+		t.Errorf("leaseInteractions call count = %d, want 2", got)
+	}
+	mu.Lock()
+	gotLeaseHdrs := append([]string(nil), leaseEnvKeyHdr...)
+	mu.Unlock()
+	for i, hdr := range gotLeaseHdrs {
+		if hdr != envKey {
+			t.Errorf("leaseInteractions call %d x-goog-environment-key = %q, want %q", i, hdr, envKey)
+		}
+	}
+}
+
+// TestEnvironmentsCreateSourcesShorthand guards the shipped `-s` shorthand for
+// `environments create --sources`. `--system-instruction` shares the initial,
+// so the generator drops `-s` unless the shorthand is pinned (b/584379945).
+func TestEnvironmentsCreateSourcesShorthand(t *testing.T) {
+	env := map[string]string{
+		"GEMINI_NO_KEYRING": "true",
+		"GEMINI_API_KEY":    "api_key_test",
+	}
+	args := append(baseArgs("http://127.0.0.1:1"),
+		"--dry-run",
+		"environments", "create",
+		"-s", `[{"type":"inline","target":"main.py","content":"print(1)"}]`,
+		"--system-instruction", "Be concise.",
+	)
+	res := runCLI(t, t.TempDir(), env, args...)
+	if res.err != nil {
+		t.Fatalf("environments create -s --dry-run failed: %v\nstderr: %s", res.err, res.stderr)
+	}
+	body := parseDryRunBody(t, res.stdout)
+	sources, ok := body["sources"].([]any)
+	if !ok || len(sources) != 1 {
+		t.Fatalf("dry-run body sources = %#v, want 1 source from -s", body["sources"])
+	}
+	if got := body["system_instruction"]; got != "Be concise." {
+		t.Errorf("dry-run body system_instruction = %#v, want %q", got, "Be concise.")
 	}
 }

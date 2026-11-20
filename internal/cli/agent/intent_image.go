@@ -42,9 +42,10 @@ func InitIntentImage(parent *cobra.Command) error {
 			flagutil.AnnotationWholeBodyFlag: "body",
 			"speakeasy_strict_body_keys":     "true",
 			"speakeasy_help_defaults":        "model gemini-nano-banana-2.1 · output ./gemini-image-{timestamp}-{rand}.{ext}",
-			"speakeasy_help_learn":           "https://ai.google.dev/gemini-api/docs/image-generation",
+			"speakeasy_help_learn":           "https://aistudio.google.com/docs/image-generation",
 			"speakeasy_help_escalate":        "full request control via gemini-api agent run",
 			"speakeasy_artifact":             "{\"pointer\":[{\"field\":\"steps\"},{\"wild\":true},{\"field\":\"content\"},{\"wild\":true}],\"kind\":\"image\",\"defaultPath\":\"gemini-image-{timestamp}-{rand}.{ext}\"}",
+			"speakeasy_outcome":              "{\"statePointer\":\"/status\",\"streamStatePointer\":\"/data/interaction/status\",\"states\":{\"budget_exceeded\":\"success\",\"cancelled\":\"failure\",\"completed\":\"success\",\"failed\":\"failure\",\"in_progress\":\"pending\",\"incomplete\":\"success\",\"queued\":\"pending\",\"requires_action\":\"handoff\",\"requires_continuation\":\"pending\"},\"errorPointer\":\"/errors\",\"errorMessageField\":\"message\"}",
 		},
 	}
 	intentMeta := flagutil.NonBodyMeta(runCmdMeta, "Body")
@@ -141,7 +142,7 @@ func runIntentImageCmd(cmd *cobra.Command, args []string) error {
 		return usage.EmitSchema(cmd, cmd.OutOrStdout())
 	}
 	if requested, _ := cmd.Flags().GetBool("schema"); requested {
-		return usage.EmitBodySchema(cmd.OutOrStdout(), "CreateInteraction")
+		return usage.EmitBodySchema(cmd.OutOrStdout(), "CreateInteraction#ModelInteraction")
 	}
 	if flagutil.FlagChanged(cmd, "raw-response") && flagutil.FlagChanged(cmd, "out") {
 		return flagutil.WithCLIValidation(fmt.Errorf("--raw-response prints the raw API response and cannot be combined with --out"))
@@ -266,6 +267,13 @@ func runIntentImageCmd(cmd *cobra.Command, args []string) error {
 			if err := flagutil.MergePresetStdinBody(cmd, intentImagePreset); err != nil {
 				return err
 			}
+		}
+	}
+	if bodySupplied {
+		if err := flagutil.RequireBodyInputs(cmd, suppliedBodyFlag, []flagutil.RequiredBodyInput{
+			{Path: []string{"input"}, Source: "the <prompt> argument"},
+		}); err != nil {
+			return err
 		}
 	}
 	return runRunCmd(cmd, nil)

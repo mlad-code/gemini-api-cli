@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"mime"
 	"net/url"
 	"os"
@@ -32,7 +33,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/google-gemini/gemini-api-cli/internal/client"
-	"github.com/google-gemini/gemini-api-cli/internal/config"
 	"github.com/google-gemini/gemini-api-cli/internal/flagutil"
 	"github.com/google-gemini/gemini-api-cli/internal/interactive"
 	"github.com/google-gemini/gemini-api-cli/internal/output"
@@ -40,6 +40,7 @@ import (
 	"github.com/google-gemini/gemini-api-cli/internal/sdk/models/interactions"
 	"github.com/google-gemini/gemini-api-cli/internal/sdk/models/operations"
 	"github.com/google-gemini/gemini-api-cli/internal/sdk"
+	"github.com/google-gemini/gemini-api-cli/internal/sdk/sdkinternal/hooks"
 	"github.com/google-gemini/gemini-api-cli/internal/usage"
 	"github.com/spf13/cobra"
 )
@@ -223,11 +224,34 @@ func (m *mediaSource) block(cmd *cobra.Command) (interactions.Content, error) {
 	if isDryRun(cmd) {
 		// No bytes leave the machine under --dry-run; keep the preview
 		// readable instead of streaming the payload to stderr.
-		info, err := os.Stat(m.path)
-		if err != nil {
-			return interactions.Content{}, usageError(fmt.Sprintf("%s: cannot read file: %v", m.ref, err))
+		var raw []byte
+		var size int64
+		if class == contentText {
+			var err error
+			raw, err = os.ReadFile(m.path)
+			if err != nil {
+				return interactions.Content{}, usageError(fmt.Sprintf("%s: cannot read file: %v", m.ref, err))
+			}
+			size = int64(len(raw))
+		} else {
+			info, err := os.Stat(m.path)
+			if err != nil {
+				return interactions.Content{}, usageError(fmt.Sprintf("%s: cannot read file: %v", m.ref, err))
+			}
+			size = info.Size()
 		}
-		data = fmt.Appendf(nil, "<bytes:%d>", info.Size())
+		m.inlineBytes = inlineCost(size, class)
+		if m.inlineBytes > maxInlineBytes {
+			return interactions.Content{}, usageError(fmt.Sprintf("%s: file grew past the inline limit while the command ran", m.ref))
+		}
+		realPayloadJSONLen := 2 + int64(base64.StdEncoding.EncodedLen(int(size)))
+		if class == contentText {
+			realJSON, _ := json.Marshal(string(raw))
+			realPayloadJSONLen = int64(len(realJSON))
+		}
+		data = fmt.Appendf(nil, "<bytes:%d>", size)
+		previewJSON, _ := json.Marshal(string(data))
+		cmd.SetContext(hooks.WithDryRunBodyDelta(cmd.Context(), realPayloadJSONLen-int64(len(previewJSON))))
 	} else {
 		raw, err := os.ReadFile(m.path)
 		if err != nil {
@@ -532,7 +556,7 @@ func resolveMediaSource(cmd *cobra.Command, s *sdk.GeminiAPI, arg, mimeOverride 
 // its URI and MIME type. Under --dry-run the lookup is previewed and a
 // placeholder URI is used so the main request can still be previewed.
 func resolveRemoteFile(cmd *cobra.Command, s *sdk.GeminiAPI, name, id, mimeOverride, ref string, policy mediaPolicy) (*mediaSource, error) {
-	fileURI := "https://generativelanguage.googleapis.com/v1beta/" + name
+	fileURI := expandedFilesURI(cmd, name)
 	mimeType := strings.ToLower(strings.TrimSpace(mimeOverride))
 	if err := checkRemoteMIME(mimeType, ref, policy); err != nil {
 		return nil, err // a bad override fails before the lookup is sent
@@ -691,7 +715,7 @@ func attachInteractionInputs(root *cobra.Command) error {
 	agentRunCmd.Long = strings.Replace(
 		agentRunCmd.Long,
 		"Run one interaction with a Gemini model (--model, the default) or a\nmanaged agent (--agent); the two flag sets are mutually exclusive.\nStreams text as it arrives; --stream=false returns one complete\ninteraction. --body takes the exact request JSON (\"model\"/\"agent\" picks the variant).",
-		"Run one interaction with a Gemini model (--model, default) or a managed agent (--agent).\nStreams text as it arrives (--stream=false for one complete interaction); --body takes exact request JSON.",
+		"Run one interaction with a Gemini model (--model, default) or a managed agent (--agent).\nStreams text as it arrives (--stream=false or --background for one interaction unless --stream is passed); --body takes exact request JSON.",
 		1,
 	)
 	return nil
@@ -851,7 +875,7 @@ func attachIntentInputs(cmd *cobra.Command, argName, promptDesc string, in inten
 				c.SetIn(bytes.NewReader(rawBody))
 				bodySource = "stdin"
 			}
-			if err := json.Unmarshal(rawBody, &bodyMap); err != nil || bodyMap == nil {
+			if err := decodeBodyJSON(rawBody, &bodyMap); err != nil || bodyMap == nil {
 				if err != nil && stdinAttached && in.stdin {
 					return usageError(fmt.Sprintf("failed to parse stdin as JSON: %v", err),
 						"Piped stdin is read as the JSON request body; add --stdin to send it as prompt text instead")
@@ -940,21 +964,118 @@ func attachIntentInputs(cmd *cobra.Command, argName, promptDesc string, in inten
 	return nil
 }
 
+func decodeBodyJSON(raw []byte, dst *map[string]any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("invalid character after top-level value")
+		}
+		return err
+	}
+	return nil
+}
+
 func contentToMap(blk interactions.Content) (map[string]any, error) {
 	raw, err := json.Marshal(blk)
 	if err != nil {
 		return nil, err
 	}
 	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := decodeBodyJSON(raw, &m); err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
+func wrapUserInputStep(content []any) []any {
+	return []any{
+		map[string]any{
+			"type":    string(interactions.StepTypeUserInput),
+			"content": content,
+		},
+	}
+}
+
+func objectType(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	s, _ := m["type"].(string)
+	return strings.TrimSpace(s)
+}
+
+func isContentBlockType(typ string) bool {
+	switch interactions.ContentType(typ) {
+	case interactions.ContentTypeText,
+		interactions.ContentTypeImage,
+		interactions.ContentTypeAudio,
+		interactions.ContentTypeDocument,
+		interactions.ContentTypeVideo:
+		return true
+	default:
+		return false
+	}
+}
+
+func isStepType(typ string) bool {
+	return typ != "" && !isContentBlockType(typ)
+}
+
+func mergeMediaIntoUserInputStep(mediaBlocks []any, step map[string]any) (map[string]any, error) {
+	cloned := maps.Clone(step)
+	if cloned == nil {
+		cloned = make(map[string]any, 2)
+	}
+	cloned["type"] = string(interactions.StepTypeUserInput)
+
+	rawContent, exists := step["content"]
+	if !exists || rawContent == nil {
+		cloned["content"] = append([]any(nil), mediaBlocks...)
+		return cloned, nil
+	}
+	switch c := rawContent.(type) {
+	case string:
+		out := make([]any, 0, len(mediaBlocks)+1)
+		out = append(out, mediaBlocks...)
+		if c != "" {
+			out = append(out, map[string]any{"type": "text", "text": c})
+		}
+		cloned["content"] = out
+		return cloned, nil
+	case map[string]any:
+		if !isContentBlockType(objectType(c)) {
+			return nil, usageError("cannot combine --input with non-content object in \"user_input\" step content")
+		}
+		out := make([]any, 0, len(mediaBlocks)+1)
+		out = append(out, mediaBlocks...)
+		out = append(out, c)
+		cloned["content"] = out
+		return cloned, nil
+	case []any:
+		for _, item := range c {
+			m, ok := item.(map[string]any)
+			if !ok || !isContentBlockType(objectType(m)) {
+				return nil, usageError("cannot combine --input with non-content element in \"user_input\" step content")
+			}
+		}
+		out := make([]any, 0, len(mediaBlocks)+len(c))
+		out = append(out, mediaBlocks...)
+		out = append(out, c...)
+		cloned["content"] = out
+		return cloned, nil
+	default:
+		return nil, usageError("cannot combine --input with non-content \"content\" in \"user_input\" step")
+	}
+}
+
 func mergeMediaBlocksIntoInput(mediaBlocks []any, existing any) (any, error) {
 	if existing == nil {
-		return mediaBlocks, nil
+		return wrapUserInputStep(append([]any(nil), mediaBlocks...)), nil
 	}
 	switch v := existing.(type) {
 	case string:
@@ -963,17 +1084,103 @@ func mergeMediaBlocksIntoInput(mediaBlocks []any, existing any) (any, error) {
 		if v != "" {
 			out = append(out, map[string]any{"type": "text", "text": v})
 		}
-		return out, nil
-	case []any:
-		out := make([]any, 0, len(mediaBlocks)+len(v))
-		out = append(out, mediaBlocks...)
-		out = append(out, v...)
-		return out, nil
+		return wrapUserInputStep(out), nil
 	case map[string]any:
-		out := make([]any, 0, len(mediaBlocks)+1)
-		out = append(out, mediaBlocks...)
-		out = append(out, v)
-		return out, nil
+		typ := objectType(v)
+		switch {
+		case isContentBlockType(typ):
+			out := make([]any, 0, len(mediaBlocks)+1)
+			out = append(out, mediaBlocks...)
+			out = append(out, v)
+			return wrapUserInputStep(out), nil
+		case typ == string(interactions.StepTypeUserInput):
+			mergedStep, err := mergeMediaIntoUserInputStep(mediaBlocks, v)
+			if err != nil {
+				return nil, err
+			}
+			return []any{mergedStep}, nil
+		case typ == string(interactions.StepTypeFunctionResult):
+			return []any{
+				v,
+				map[string]any{
+					"type":    string(interactions.StepTypeUserInput),
+					"content": append([]any(nil), mediaBlocks...),
+				},
+			}, nil
+		case isStepType(typ):
+			return nil, usageError(fmt.Sprintf("cannot combine --input with %q step in request body; expected a \"user_input\" step or content blocks", typ))
+		default:
+			return nil, usageError("cannot combine --input with unrecognized input object in request body; expected a content block or \"user_input\" step")
+		}
+	case []any:
+		if len(v) == 0 {
+			return wrapUserInputStep(append([]any(nil), mediaBlocks...)), nil
+		}
+		var (
+			hasContent        bool
+			hasStep           bool
+			allFunctionResult = true
+			userInputCount    int
+			lastUserInputIdx  = -1
+		)
+		for i, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				return nil, usageError("cannot combine --input with non-object element in request body \"input\" array")
+			}
+			typ := objectType(m)
+			switch {
+			case isContentBlockType(typ):
+				hasContent = true
+				allFunctionResult = false
+			case isStepType(typ):
+				hasStep = true
+				if typ != string(interactions.StepTypeFunctionResult) {
+					allFunctionResult = false
+				}
+				if typ == string(interactions.StepTypeUserInput) {
+					userInputCount++
+					lastUserInputIdx = i
+				}
+			default:
+				return nil, usageError("cannot combine --input with unrecognized element in request body \"input\" array")
+			}
+		}
+		if hasContent && hasStep {
+			return nil, usageError("cannot combine --input with a request body that mixes step objects and bare content blocks in \"input\"")
+		}
+		if hasContent {
+			out := make([]any, 0, len(mediaBlocks)+len(v))
+			out = append(out, mediaBlocks...)
+			out = append(out, v...)
+			return wrapUserInputStep(out), nil
+		}
+		if userInputCount == 0 {
+			if allFunctionResult {
+				outSteps := make([]any, 0, len(v)+1)
+				outSteps = append(outSteps, v...)
+				outSteps = append(outSteps, map[string]any{
+					"type":    string(interactions.StepTypeUserInput),
+					"content": append([]any(nil), mediaBlocks...),
+				})
+				return outSteps, nil
+			}
+			return nil, usageError("cannot combine --input with request body steps that do not contain a \"user_input\" step")
+		}
+		if lastUserInputIdx != len(v)-1 {
+			return nil, usageError("cannot combine --input with a request body where \"user_input\" is not the final step; place the media block in the target step in --body")
+		}
+		if len(v) >= 2 && objectType(v[len(v)-2].(map[string]any)) == string(interactions.StepTypeUserInput) {
+			return nil, usageError("cannot combine --input with a request body containing multiple consecutive \"user_input\" steps; place the media block in the target step in --body")
+		}
+		mergedStep, err := mergeMediaIntoUserInputStep(mediaBlocks, v[lastUserInputIdx].(map[string]any))
+		if err != nil {
+			return nil, err
+		}
+		outSteps := make([]any, len(v))
+		copy(outSteps, v)
+		outSteps[lastUserInputIdx] = mergedStep
+		return outSteps, nil
 	default:
 		return nil, usageError("cannot combine --input with non-content input in request body")
 	}
@@ -1029,17 +1236,10 @@ func normalizeInputValueFileURIs(cmd *cobra.Command, s **sdk.GeminiAPI, val any)
 // uri in a files.get response does.
 func expandedFilesURI(cmd *cobra.Command, name string) string {
 	base := "https://generativelanguage.googleapis.com"
-	ver := "v1beta"
-	if cmd != nil && flagutil.FlagChanged(cmd, "api-version") {
-		if v, ok := flagutil.GetStringFlag(cmd, "api-version"); ok && strings.TrimSpace(v) != "" {
-			ver = strings.Trim(strings.TrimSpace(v), "/")
-		}
-	} else if v := config.GetString("api-version"); strings.TrimSpace(v) != "" {
-		ver = strings.Trim(strings.TrimSpace(v), "/")
-	} else if cmd != nil {
-		if v, ok := flagutil.GetStringFlag(cmd, "api-version"); ok && strings.TrimSpace(v) != "" {
-			ver = strings.Trim(strings.TrimSpace(v), "/")
-		}
+	ver := resolveAPIVersion(cmd)
+	ver = strings.Trim(strings.TrimSpace(ver), "/")
+	if ver == "" {
+		ver = defaultAPIVersion
 	}
 	return base + "/" + ver + "/" + name
 }
@@ -1078,24 +1278,6 @@ func normalizeContentObjectURI(cmd *cobra.Command, s **sdk.GeminiAPI, obj map[st
 	existingMime = strings.TrimSpace(existingMime)
 	existingType, _ := obj["type"].(string)
 	existingType = strings.TrimSpace(existingType)
-
-	if isDryRun(cmd) {
-		if rewrite {
-			obj["uri"] = expandedFilesURI(cmd, name)
-		}
-		if existingMime != "" {
-			canonMime := canonicalRemoteMIME(existingMime)
-			if err := checkRemoteMIME(canonMime, ref, analyzePolicy); err != nil {
-				return err
-			}
-			obj["mime_type"] = canonMime
-			if existingType == "" {
-				blk := mediaContentBlock(canonMime, expandedFilesURI(cmd, name), false)
-				obj["type"] = string(blk.Type)
-			}
-		}
-		return nil
-	}
 
 	if existingMime == "" {
 		if *s == nil {

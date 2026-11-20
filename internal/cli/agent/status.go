@@ -48,6 +48,7 @@ func initStatusCmd(parent *cobra.Command) error {
 			"speakeasy_operation":       "getInteractionById",
 			"speakeasy_stream_select":   "/data/delta/text",
 			"speakeasy_stream_metadata": "[{\"label\":\"Interaction ID\",\"pointers\":[\"/data/interaction/id\"]}]",
+			"speakeasy_outcome":         "{\"statePointer\":\"/status\",\"streamStatePointer\":\"/data/interaction/status\",\"states\":{\"budget_exceeded\":\"success\",\"cancelled\":\"failure\",\"completed\":\"success\",\"failed\":\"failure\",\"in_progress\":\"pending\",\"incomplete\":\"success\",\"queued\":\"pending\",\"requires_action\":\"handoff\",\"requires_continuation\":\"pending\"},\"errorPointer\":\"/errors\",\"errorMessageField\":\"message\"}",
 		},
 	}
 	flagutil.RegisterFlags(cmd, statusCmdMeta)
@@ -97,11 +98,13 @@ func runStatusCmd(cmd *cobra.Command, args []string) error {
 	// Streaming response — iterate events and output incrementally.
 	// Skip streaming iteration in dry-run mode (synthetic response has no stream).
 	if !client.IsDryRun(cmd) {
+		stopProgress := output.StartRequestProgress(cmd)
 		res, err := s.Agent.Status(cmd.Context(), *req, sdkOpts...)
 		if err != nil {
+			stopProgress()
 			return output.Error(cmd, err)
 		}
-		return output.StreamResult(cmd, res, "InteractionSSEStreamEvent")
+		return output.StreamResult(cmd, res, "InteractionSSEStreamEvent", stopProgress)
 	}
 	res, err := s.Agent.Status(cmd.Context(), *req, sdkOpts...)
 	if err != nil {

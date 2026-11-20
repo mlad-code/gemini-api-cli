@@ -15,7 +15,9 @@ gemini-api image "A friendly robot mascot for a developer tool" --out ./assets/
 
 A prompt goes in. An image lands in your project. Your agent gets the file path and keeps building. The same binary can return an analysis, a voiceover, a transcript, or the interaction ID of a background managed-agent run.
 
-[Installation](#installation) · [Quick start](#quick-start) · [Command overview](#command-overview) · [Agent discovery](#agent-discovery-and-machine-interface) · [Workflows](#agent-workflows) · [Gemini API docs](https://ai.google.dev/gemini-api/docs)
+[Installation](#installation) · [Quick start](#quick-start) · [Command overview](#command-overview) · [Agent discovery](#agent-discovery-and-machine-interface) · [Workflows](#agent-workflows) · [Self-hosted environments](docs/self-hosted/README.md) · [Contributing](CONTRIBUTING.md) · [Gemini API docs](https://aistudio.google.com/docs)
+
+> **Bugs and feedback:** Open a [GitHub Issue](https://github.com/google-gemini/gemini-api-cli/issues). We do **not** accept pull requests — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -78,7 +80,7 @@ Download prebuilt archives for macOS, Linux, and Windows from [GitHub Releases](
 
 #### Option A: Gemini API key
 
-Create an API key in Google AI Studio (see the [Gemini API key docs](https://ai.google.dev/gemini-api/docs/api-key)) and make it available to your shell or your agent's subprocess environment:
+Create an API key in Google AI Studio (see the [Gemini API key docs](https://aistudio.google.com/docs/api-key)) and make it available to your shell or your agent's subprocess environment:
 
 ```bash
 export GEMINI_API_KEY="YOUR_API_KEY"
@@ -116,7 +118,7 @@ You have access to gemini-api through the shell.
 Use it to call Gemini models, generate or edit media, analyze files, or launch managed agents.
 1. Inspect --help or --usage to choose a command, and --schema when building a --body JSON payload.
 2. Preview API calls with --dry-run (or --dry-run --output-format json).
-3. For discrete JSON output or --jq filtering on streaming/background commands (generate, agent run, agent status), pass --stream=false --output-format json.
+3. For discrete JSON output or --jq filtering on streaming commands (generate, agent run, agent status --stream), pass --stream=false --output-format json (--background on agent run returns a single interaction without streaming unless --stream is passed).
 4. Capture returned file paths (from media commands) and interaction IDs (from agent/model runs) to continue multi-step tasks.
 ```
 
@@ -138,19 +140,20 @@ Run `gemini-api --help` to see all top-level commands, or `gemini-api <command> 
 
 | Category | Command | Subcommands / Key Flags | Description & default model |
 |---|---|---|---|
-| **Create** | `gemini-api generate` | `-m`, `-i/--input`, `--stdin`, `--system`, `--stream=false`, `--body` | Text and multimodal generation (`gemini-3.8-flash`) |
+| **Create** | `gemini-api generate` | `-m`, `-i/--input`, `--stdin`, `--system`, `--stream=false`, `--body` | Text and multimodal generation (`gemini-4-hydrogen`) |
 | | `gemini-api image` | `-m`, `-i/--input`, `--stdin`, `--out`, `--body` | Generate or edit images (`gemini-nano-banana-2.1`) |
-| | `gemini-api tts` | `-f/--file`, `--stdin`, `--voice`, `--multi-speaker`, `--out` | Text-to-speech audio generation (`gemini-3.8-flash-tts`) |
+| | `gemini-api tts` | `-f/--file`, `--stdin`, `--voice`, `--voice-prompt`, `--style`, `--multi-speaker`, `--out` | Text-to-speech audio generation (`gemini-3.8-flash-tts`) |
 | | `gemini-api music` | `-m`, `-f/--file`, `--stdin`, `--out`, `--body` | Music generation (`lyria-3.5`) |
-| | `gemini-api video` | `-m`, `-i/--input`, `--stdin`, `--async`, `--out`, `--body` | Conversational video generation and editing (`gemini-omni-1.1-flash`) |
-| **Understand** | `gemini-api analyze` | `-i/--input` *(repeatable)*, `--stdin`, `--system`, `-m` | Ask questions about PDFs, images, audio, video, CSV/text files, or YouTube URLs (`gemini-3.8-flash`) |
-| | `gemini-api transcribe` | `-i/--input` *(repeatable)*, `--format` (`md`, `text`, `json`, `srt`), `--out` | Transcribe audio or video to Markdown (`md`), plain text (`text`), JSON (`json`), or SRT captions (`srt`) (`gemini-3.8-flash`) |
+| | `gemini-api video` | `-m`, `-i/--input`, `--stdin`, `--async`, `--out`, `--body` | Conversational video generation and editing (`gemini-omni-1.2-flash`) |
+| **Understand** | `gemini-api analyze` | `-i/--input` *(repeatable)*, `--stdin`, `--system`, `-m` | Ask questions about PDFs, images, audio, video, CSV/text files, or YouTube URLs (`gemini-4-hydrogen`) |
+| | `gemini-api transcribe` | `-i/--input` *(repeatable)*, `--format` (`md`, `text`, `json`, `srt`), `--out` | Transcribe audio or video to Markdown (`md`), plain text (`text`), JSON (`json`), or SRT captions (`srt`) (`gemini-3.5-transcribe`) |
 | **Manage** | `gemini-api agent` | `run`, `status`, `cancel`, `delete-interaction`, `create`, `list`, `get`, `delete` | Run interactions with models or managed agents (`run`, `status`, `cancel`) and manage agent definitions |
 | | `gemini-api files` | `upload`, `list`, `get`, `generated-files-list`, `register`, `delete` | Upload, list, inspect, register, and delete files via the Files API (48-hour retention) |
 | | `gemini-api models` | *(bare catalog)*, `list` (`--all`), `get` | View the offline model catalog, or query live API models (`list`, `get`) |
+| | `gemini-api voices` | `create`, `list` (`--all`), `get`, `delete` | Design, replicate, list, inspect, and delete custom voices |
 | | `gemini-api configure` | `--api-key`, `--interactive`, `--output-format` | Configure authentication, global parameters, and persistent preferences |
 | | `gemini-api auth` / `whoami` | `auth login`, `auth whoami`, `auth logout` | Manage stored credentials (`auth`) or inspect active authentication and configuration (`whoami`) |
-| **Advanced** | `gemini-api environments` | `create`, `list`, `get`, `delete`, `files` (`list`, `upload`, `download`) | Manage sandbox environments and upload, list, or download environment files |
+| **Advanced** | `gemini-api environments` | `create`, `list`, `get`, `delete`, `files` (`list`, `upload`, `download`), `connect`, `poll`, `serve` | Manage sandbox environments, upload/list/download environment files, or run [self-hosted environments](docs/self-hosted/README.md) |
 | | `gemini-api credentials` | `create`, `list`, `get`, `update`, `delete` | Manage stored server-side credentials for managed agents |
 | | `gemini-api webhooks` | `create`, `list`, `get`, `update`, `ping`, `rotate-signing-secret`, `delete` | Manage webhook endpoints and signing secrets for event delivery |
 | | `gemini-api triggers` | `list`, `get`, `update`, `run`, `list-executions`, `delete` | Inspect, run, update, and delete cron triggers for managed agents |
@@ -232,13 +235,12 @@ gemini-api analyze --input "$FILE_URI" "List the key action items with timestamp
 
 ### 3. Launch and poll a background managed agent
 
-Delegate multi-step research or coding tasks to a Gemini managed agent such as Deep Research. Pass `--background --stream=false` so the CLI returns the interaction ID immediately instead of holding open an SSE stream:
+Delegate multi-step research or coding tasks to a Gemini managed agent such as Deep Research. Pass `--background` so the CLI returns a single interaction (no stream, unless `--stream` is passed) with the interaction ID immediately instead of holding open an SSE stream:
 
 ```bash
 INTERACTION_ID=$(gemini-api agent run "Research battery recycling approaches and cite sources" \
   --agent deep-research-preview-04-2026 \
   --background \
-  --stream=false \
   --jq '.id')
 echo "Started interaction: $INTERACTION_ID"
 ```
@@ -261,10 +263,10 @@ gemini-api models
 
 # Query all live models available to your API key (--all auto-paginates across pages)
 gemini-api models list --all
-gemini-api models get gemini-3.8-flash
+gemini-api models get gemini-4-hydrogen
 
 # Run a prompt with a specific model
-gemini-api generate "Review this approach: cache immutable responses by content hash" --model gemini-3.8-flash
+gemini-api generate "Review this approach: cache immutable responses by content hash" --model gemini-4-hydrogen
 ```
 
 ---
@@ -338,10 +340,10 @@ The CLI stores no local conversation state—server-side interactions and upload
 ## Status, feedback, and contributions
 
 > [!NOTE]
-> `gemini-api` is in **beta** and evolving alongside the [Gemini Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview). Breaking changes may occur between releases; we recommend pinning to a specific [release version](https://github.com/google-gemini/gemini-api-cli/releases) in CI and automated workflows.
+> `gemini-api` is in **beta** and evolving alongside the [Gemini Interactions API](https://aistudio.google.com/docs/interactions-overview). Breaking changes may occur between releases; we recommend pinning to a specific [release version](https://github.com/google-gemini/gemini-api-cli/releases) in CI and automated workflows.
 
-- **Feedback & bug reports:** Try `gemini-api` in your agent workflow and let us know where it helps or where it gets in the way by opening an issue in [GitHub Issues](https://github.com/google-gemini/gemini-api-cli/issues).
-- **Contributions:** We are **not** accepting open source contributions (pull requests) at this time.
+- **Bugs & feedback:** Found a bug or have feedback on `gemini-api`? Please open an issue in [GitHub Issues](https://github.com/google-gemini/gemini-api-cli/issues).
+- **Contributions (pull requests not accepted):** At this time, we are **not** accepting external pull requests or code contributions, and any opened PRs will be closed without review — see [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Releases:** Browse changelog notes and prebuilt binaries on [GitHub Releases](https://github.com/google-gemini/gemini-api-cli/releases).
 
 ---

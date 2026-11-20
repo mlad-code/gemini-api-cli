@@ -45,8 +45,8 @@ import (
 // Curated model defaults for the porcelain commands. They mirror the Build
 // Spec's tier-1 line-up and the reference CLI's model registry.
 const (
-	defaultTextModel       = "gemini-3.8-flash"
-	defaultTranscribeModel = "gemini-3.8-flash"
+	defaultTextModel       = "gemini-4-hydrogen"
+	defaultTranscribeModel = "gemini-3.5-transcribe"
 	defaultTTSModel        = "gemini-3.8-flash-tts"
 	defaultTTSVoice        = "Kore"
 )
@@ -188,7 +188,7 @@ func emitResult(cmd *cobra.Command, deliverable string, envelope map[string]any)
 
 // modelFlag registers the shared -m/--model override with its curated default.
 func modelFlag(cmd *cobra.Command, def, route string) {
-	cmd.Flags().StringP("model", "m", "", fmt.Sprintf("Override model (default: %s) — %s-capable models: https://ai.google.dev/gemini-api/docs/models", def, route))
+	cmd.Flags().StringP("model", "m", "", fmt.Sprintf("Override model (default: %s) — %s-capable models: https://aistudio.google.com/docs/models", def, route))
 }
 
 // resolveModel returns the --model override or the curated default, stripped
@@ -208,15 +208,12 @@ func resolveModel(cmd *cobra.Command, def string) (string, error) {
 
 // normalizeModelFlag holds an explicit --model on a generated command to the
 // same id shape as resolveModel, stripping a models/ prefix in place. An unset
-// or blank flag is left to the command's own default.
+// flag is left to the command's own default.
 func normalizeModelFlag(cmd *cobra.Command) error {
 	if cmd.Flags().Lookup("model") == nil || !flagutil.FlagChanged(cmd, "model") {
 		return nil
 	}
 	model, _ := flagutil.GetStringFlag(cmd, "model")
-	if strings.TrimSpace(model) == "" {
-		return nil
-	}
 	id, err := normalizeModelPositional(model)
 	if err != nil {
 		return usageError("--model: " + err.Error())
@@ -334,7 +331,8 @@ func modelPtr(model string) *interactions.Model {
 // one-shot transformation — nothing continues or manages the interaction
 // afterwards — so retaining the prompt, media, and output would serve no one.
 func newModelInteraction(model string, content ...interactions.Content) interactions.CreateModelInteraction {
-	input := interactions.CreateInteractionsInputArrayOfContent(content)
+	step := interactions.CreateStepUserInput(interactions.UserInputStep{Content: content})
+	input := interactions.CreateInteractionsInputArrayOfStep([]interactions.Step{step})
 	return interactions.CreateModelInteraction{
 		Model:  modelPtr(model),
 		Stream: boolPtr(false),

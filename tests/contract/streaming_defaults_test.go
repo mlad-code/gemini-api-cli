@@ -103,6 +103,109 @@ func TestAgentRunDryRunStreamsByDefault(t *testing.T) {
 	}
 }
 
+func TestAgentRunBackgroundImpliesStreamFalse(t *testing.T) {
+	const (
+		jsonAccept = "application/json;q=1, text/event-stream;q=0"
+		sseAccept  = "text/event-stream"
+	)
+	tests := []struct {
+		name           string
+		args           []string
+		stdin          string
+		wantStream     bool
+		wantBackground any
+		wantAccept     string
+	}{
+		{
+			name:           "model --background implies stream:false",
+			args:           []string{"agent", "run", "hi", "--background"},
+			wantStream:     false,
+			wantBackground: true,
+			wantAccept:     jsonAccept,
+		},
+		{
+			name:           "agent --background implies stream:false",
+			args:           []string{"agent", "run", "hi", "--agent", "deep-research-preview-04-2026", "--background"},
+			wantStream:     false,
+			wantBackground: true,
+			wantAccept:     jsonAccept,
+		},
+		{
+			name:           "--background --stream keeps explicit stream:true",
+			args:           []string{"agent", "run", "hi", "--background", "--stream"},
+			wantStream:     true,
+			wantBackground: true,
+			wantAccept:     sseAccept,
+		},
+		{
+			name:           "--body background:true implies stream:false",
+			args:           []string{"agent", "run", "--body", `{"input":"hi","background":true}`},
+			wantStream:     false,
+			wantBackground: true,
+			wantAccept:     jsonAccept,
+		},
+		{
+			name:           "stdin background:true implies stream:false",
+			args:           []string{"agent", "run"},
+			stdin:          `{"input":"hi","background":true}`,
+			wantStream:     false,
+			wantBackground: true,
+			wantAccept:     jsonAccept,
+		},
+		{
+			name:           "--body background:true stream:true keeps explicit stream:true",
+			args:           []string{"agent", "run", "--body", `{"input":"hi","background":true,"stream":true}`},
+			wantStream:     true,
+			wantBackground: true,
+			wantAccept:     sseAccept,
+		},
+		{
+			name:           "default without --background streams",
+			args:           []string{"agent", "run", "hi"},
+			wantStream:     true,
+			wantBackground: nil,
+			wantAccept:     sseAccept,
+		},
+		{
+			name:           "--background=false keeps stream:true",
+			args:           []string{"agent", "run", "hi", "--background=false"},
+			wantStream:     true,
+			wantBackground: false,
+			wantAccept:     sseAccept,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append(baseArgs("https://example.invalid"), "--dry-run")
+			args = append(args, tt.args...)
+			var result commandResult
+			if tt.stdin != "" {
+				result = runCLIWithStdin(t, t.TempDir(), nil, tt.stdin, args...)
+			} else {
+				result = runCLI(t, t.TempDir(), nil, args...)
+			}
+			if result.err != nil {
+				t.Fatalf("agent run --dry-run failed: %v\nstderr: %s", result.err, result.stderr)
+			}
+			request := parseDryRunRequest(t, result.stdout)
+			body := parseDryRunBody(t, result.stdout)
+			stream, ok := body["stream"].(bool)
+			if !ok {
+				t.Fatalf("dry-run stream = %#v, want a boolean\n%s", body["stream"], result.stdout)
+			}
+			if stream != tt.wantStream {
+				t.Errorf("dry-run stream = %t, want %t", stream, tt.wantStream)
+			}
+			if got := body["background"]; got != tt.wantBackground {
+				t.Errorf("dry-run background = %#v, want %#v", got, tt.wantBackground)
+			}
+			if got := dryRunHeader(t, request, "Accept"); got != tt.wantAccept {
+				t.Errorf("dry-run Accept = %q, want %q", got, tt.wantAccept)
+			}
+		})
+	}
+}
+
 func TestAgentRunStreamFlagConflictsWithBodyKey(t *testing.T) {
 	args := append(baseArgs("https://example.invalid"), "--dry-run",
 		"agent", "run", "--body", `{"model":"gemini-3.6-flash","input":"hi","stream":true}`, "--stream=false")
@@ -328,7 +431,7 @@ func TestImageInteractivePromptsForOutputFile(t *testing.T) {
 
 	base := []string{"--interactive", "--api-key", "k", "--server-url", server.URL, "--api-version", "v1beta", "--no-retries", "--color", "never", "image"}
 
-	// A chosen path (extension corrected to the returned MIME type, with a note).
+	// A chosen path with a mismatched media extension is kept as given, with a mismatch note.
 	target := filepath.Join(dir, "shots", "hero.jpg")
 	prompter := &scriptedPrompter{t: t, answers: map[string][]string{"arg:prompt": {"a lighthouse"}, "flag:out": {target}}}
 	stdout, stderr, err := executeInteractive(t, prompter, base...)
@@ -338,15 +441,14 @@ func TestImageInteractivePromptsForOutputFile(t *testing.T) {
 	if !reflect.DeepEqual(prompter.calls, [][]string{{"arg:prompt", "flag:out"}}) {
 		t.Fatalf("prompt calls = %#v, want one call for arg:prompt then flag:out", prompter.calls)
 	}
-	wantPath := filepath.Join(dir, "shots", "hero.png")
-	if strings.TrimSpace(stdout) != wantPath {
-		t.Errorf("stdout = %q, want %q", stdout, wantPath)
+	if strings.TrimSpace(stdout) != target {
+		t.Errorf("stdout = %q, want %q", stdout, target)
 	}
-	if data, err := os.ReadFile(wantPath); err != nil || len(data) != 69 {
-		t.Errorf("written file %q: err=%v len=%d, want the 69-byte PNG", wantPath, err, len(data))
+	if data, err := os.ReadFile(target); err != nil || len(data) != 69 {
+		t.Errorf("written file %q: err=%v len=%d, want the 69-byte PNG", target, err, len(data))
 	}
-	if !strings.Contains(stderr, "hero.jpg") || !strings.Contains(stderr, "hero.png") {
-		t.Errorf("stderr lacks the extension-change note:\n%s", stderr)
+	if !strings.Contains(stderr, "Note: hero.jpg contains image/png content; its extension does not match") {
+		t.Errorf("stderr lacks the extension-mismatch note:\n%s", stderr)
 	}
 
 	// An empty answer keeps the default filename in the working directory.

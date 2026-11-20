@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -135,8 +136,8 @@ func TestAgentRunRouteDispatch(t *testing.T) {
 			t.Fatalf("agent run failed: %v\nstderr: %s", result.err, result.stderr)
 		}
 		call := <-calls
-		if got := call.body["model"]; got != "gemini-3.8-flash" {
-			t.Errorf("model = %v, want schema default gemini-3.8-flash", got)
+		if got := call.body["model"]; got != "gemini-4-hydrogen" {
+			t.Errorf("model = %v, want schema default gemini-4-hydrogen", got)
 		}
 		if got := call.body["stream"]; got != true {
 			t.Errorf("stream = %v, want the streaming preset true", got)
@@ -244,4 +245,29 @@ func TestAgentRunRouteDispatch(t *testing.T) {
 			t.Errorf("help still mentions --body-param:\n%s", result.stdout)
 		}
 	})
+}
+
+func TestEnvironmentsCreateEnvFlag(t *testing.T) {
+	server, calls := newCaptureServer(t, `{"name":"environments/env_123","displayName":"test-env"}`)
+
+	args := append(baseArgs(server.URL),
+		"environments", "create",
+		"--env", `{"PLAIN_VAR":"hello","SECRET_VAR":{"credential":"credentials/cred_123"}}`,
+	)
+	result := runCLI(t, t.TempDir(), nil, args...)
+	if result.err != nil {
+		t.Fatalf("environments create --env failed: %v\nstderr: %s", result.err, result.stderr)
+	}
+
+	call := <-calls
+	if call.method != http.MethodPost || !strings.HasSuffix(call.path, "/environments") {
+		t.Errorf("got %s %s, want POST .../environments", call.method, call.path)
+	}
+	wantEnv := map[string]any{
+		"PLAIN_VAR":  "hello",
+		"SECRET_VAR": map[string]any{"credential": "credentials/cred_123"},
+	}
+	if !reflect.DeepEqual(call.body["env"], wantEnv) {
+		t.Errorf("wire body env = %#v, want %#v", call.body["env"], wantEnv)
+	}
 }

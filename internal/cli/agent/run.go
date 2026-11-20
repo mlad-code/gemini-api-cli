@@ -28,7 +28,7 @@ import (
 )
 
 var runCmdMeta = []flagutil.FlagMeta{
-	{FlagName: "body-param", Shorthand: "b", FieldPath: "Body", Kind: flagutil.FlagKindUnion, Union: &flagutil.UnionMeta{Discriminated: false, VariantKeys: []string{"agent", "model"}, DefaultJSON: "{\"model\":\"gemini-3.8-flash\"}", TypeDescription: "JSON value (one of: { \"agent\": string, \"stream\": boolean (default: true), ... } | { \"model\": string (default: gemini-3.8-flash), \"stream\": boolean (default: true), ... }; default when neither is named: {\"model\":\"gemini-3.8-flash\"})"}},
+	{FlagName: "body-param", Shorthand: "b", FieldPath: "Body", Kind: flagutil.FlagKindUnion, Union: &flagutil.UnionMeta{Discriminated: false, VariantKeys: []string{"agent", "model"}, DefaultJSON: "{\"model\":\"gemini-4-hydrogen\"}", TypeDescription: "JSON value (one of: { \"agent\": string, \"stream\": boolean (default: true), ... } | { \"model\": string (default: gemini-4-hydrogen), \"stream\": boolean (default: true), ... }; default when neither is named: {\"model\":\"gemini-4-hydrogen\"})"}},
 }
 
 // initRunCmd initializes the run command.
@@ -36,14 +36,15 @@ func initRunCmd(parent *cobra.Command) error {
 	var cmd = &cobra.Command{
 		Use:     "run",
 		Short:   "Run an interaction with a Gemini model or a managed agent",
-		Long:    "Run one interaction with either a Gemini model or an existing managed agent.\nProvide input and choose exactly one selector: \"model\" or \"agent\".\n\nFor a first model run, use gemini-3.8-flash (recommended starting model).\nOther model IDs: https://ai.google.dev/gemini-api/docs/models\n\nPass the full JSON with --body or stdin. Set \"background\": true to\nreturn immediately with an interaction ID, then poll:\n  gemini-api agent status --id <interaction-id>\n\nBy default, streamed responses write the string selected by $.data.delta.text raw as it arrives. Use --stream=false to request one complete JSON response; use -o json to keep each full streamed event.",
-		Example: "  gemini-api agent run --body '{\"agent\":\"deep-research-preview-04-2026\",\"input\":\"Analyze market trends for Q3\",\"stream\":true}'\n  gemini-api agent run --body '{\"background\":true,\"input\":\"Write a detailed research report on solar batteries\",\"model\":\"gemini-3.8-flash\",\"stream\":true}'\n  gemini-api agent run --body '{\"input\":\"Explain the difference between concurrency and parallelism\",\"model\":\"gemini-3.8-flash\",\"stream\":true}'",
+		Long:    "Run one interaction with either a Gemini model or an existing managed agent.\nProvide input and choose exactly one selector: \"model\" or \"agent\".\n\nFor a first model run, use gemini-4-hydrogen (recommended starting model).\nOther model IDs: https://aistudio.google.com/docs/models\n\nPass the full JSON with --body or stdin. Set \"background\": true to\nreturn immediately with an interaction ID, then poll:\n  gemini-api agent status --id <interaction-id>\n\nBy default, streamed responses write the string selected by $.data.delta.text raw as it arrives. Use --stream=false to request one complete JSON response; use -o json to keep each full streamed event.",
+		Example: "  gemini-api agent run --body '{\"agent\":\"deep-research-preview-04-2026\",\"input\":\"Analyze market trends for Q3\",\"stream\":true}'\n  gemini-api agent run --body '{\"background\":true,\"input\":\"Write a detailed research report on solar batteries\",\"model\":\"gemini-4-hydrogen\",\"stream\":true}'\n  gemini-api agent run --body '{\"input\":\"Explain the difference between concurrency and parallelism\",\"model\":\"gemini-4-hydrogen\",\"stream\":true}'",
 		Args:    cobra.NoArgs,
 		RunE:    runRunCmd,
 		Annotations: map[string]string{
 			"speakeasy_operation":       "CreateInteraction",
 			"speakeasy_stream_select":   "/data/delta/text",
 			"speakeasy_stream_metadata": "[{\"label\":\"Interaction ID\",\"pointers\":[\"/data/interaction/id\"]}]",
+			"speakeasy_outcome":         "{\"statePointer\":\"/status\",\"streamStatePointer\":\"/data/interaction/status\",\"states\":{\"budget_exceeded\":\"success\",\"cancelled\":\"failure\",\"completed\":\"success\",\"failed\":\"failure\",\"in_progress\":\"pending\",\"incomplete\":\"success\",\"queued\":\"pending\",\"requires_action\":\"handoff\",\"requires_continuation\":\"pending\"},\"errorPointer\":\"/errors\",\"errorMessageField\":\"message\"}",
 		},
 	}
 	flagutil.RegisterFlags(cmd, runCmdMeta)
@@ -126,11 +127,13 @@ func executeRunCmd(cmd *cobra.Command, args []string, asyncIntent bool) (*operat
 		sdkOpts = append(sdkOpts, operations.WithSkipDeserialization())
 	}
 	if !client.IsDryRun(cmd) && !asyncIntent {
+		stopProgress := output.StartRequestProgress(cmd)
 		res, err := s.Agent.Run(cmd.Context(), *req, sdkOpts...)
 		if err != nil {
+			stopProgress()
 			return nil, output.Error(cmd, err)
 		}
-		if err := output.StreamResult(cmd, res, "InteractionSSEStreamEvent"); err != nil {
+		if err := output.StreamResult(cmd, res, "InteractionSSEStreamEvent", stopProgress); err != nil {
 			return nil, err
 		}
 		return nil, nil

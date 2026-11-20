@@ -16,6 +16,7 @@ package contract_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,11 +24,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google-gemini/gemini-api-cli/internal/cli"
 )
 
 const uploadChunk = 8 << 20
@@ -40,6 +45,7 @@ type uploadRequest struct {
 	command string
 	headers http.Header
 	body    []byte
+	ctx     context.Context
 }
 
 // uploadMock records every request of the resumable protocol. respond may
@@ -58,7 +64,7 @@ func newUploadMock(t *testing.T) *uploadMock {
 		body, _ := io.ReadAll(r.Body)
 		req := uploadRequest{
 			method: r.Method, path: r.URL.Path, query: r.URL.RawQuery, command: r.Header.Get("X-Goog-Upload-Command"),
-			headers: r.Header.Clone(), body: body,
+			headers: r.Header.Clone(), body: body, ctx: r.Context(),
 		}
 		mock.mu.Lock()
 		mock.requests = append(mock.requests, req)
@@ -583,6 +589,136 @@ func TestFilesUploadTransportParity(t *testing.T) {
 			t.Errorf("--debug leaked the API key:\n%s", result.stderr)
 		}
 	})
+
+	t.Run("repeated headers, Accept replacement, trimming, and dry-run header preview", func(t *testing.T) {
+		mock := newUploadMock(t)
+		src := writeTempFile(t, "clip.mp3", "some audio bytes")
+		args := append(
+			plainArgs(mock.URL),
+			"-H", "X-A: 1",
+			"-H", "x-a: 2",
+			"-H", "  X-Trim:  trimmed\r\n",
+			"-H", "Accept: application/vnd.custom+json",
+			"--timeout", "30s",
+			"files", "upload", src,
+		)
+		result := runCLI(t, t.TempDir(), nil, args...)
+		if result.err != nil {
+			t.Fatalf("upload failed: %v\nstderr: %s", result.err, result.stderr)
+		}
+		for _, r := range mock.recorded() {
+			if got := r.headers.Values("X-A"); !slices.Equal(got, []string{"1", "2"}) {
+				t.Errorf("%s X-A = %v, want [1 2]", r.command, got)
+			}
+			if got := r.headers.Values("X-Trim"); !slices.Equal(got, []string{"trimmed"}) {
+				t.Errorf("%s X-Trim = %v, want [trimmed]", r.command, got)
+			}
+			if got := r.headers.Values("Accept"); !slices.Equal(got, []string{"application/vnd.custom+json"}) {
+				t.Errorf("%s Accept = %v, want [application/vnd.custom+json]", r.command, got)
+			}
+		}
+
+		dryArgs := append(
+			plainArgs(mock.URL),
+			"--dry-run", "-o", "json",
+			"-H", "X-Trace: a",
+			"-H", "x-trace: b",
+			"files", "upload", src,
+		)
+		dryRes := runCLI(t, t.TempDir(), nil, dryArgs...)
+		if dryRes.err != nil {
+			t.Fatalf("dry-run failed: %v\nstderr: %s", dryRes.err, dryRes.stderr)
+		}
+		lines := strings.Split(strings.TrimSpace(dryRes.stdout), "\n")
+		if len(lines) == 0 {
+			t.Fatalf("dry-run produced empty stdout")
+		}
+		for i, line := range lines {
+			var preview struct {
+				Request struct {
+					Headers map[string][]string `json:"headers"`
+				} `json:"request"`
+			}
+			if err := json.Unmarshal([]byte(line), &preview); err != nil {
+				t.Fatalf("dry-run line %d JSON decode: %v\nline: %s", i, err, line)
+			}
+			if got := preview.Request.Headers["X-Trace"]; !slices.Equal(got, []string{"a", "b"}) {
+				t.Errorf("dry-run line %d X-Trace = %v, want [a b]", i, got)
+			}
+		}
+	})
+
+	t.Run("header, timeout, and server-url validation fail with exit 2 before network access", func(t *testing.T) {
+		mock := newUploadMock(t)
+		src := writeTempFile(t, "clip.mp3", "some audio bytes")
+		const secret = "secret-header-token-999"
+
+		badFlagCases := []struct {
+			name string
+			args []string
+		}{
+			{"missing colon", []string{"-H", "Authorization Bearer " + secret}},
+			{"invalid header name", []string{"-H", "bad name: " + secret}},
+			{"embedded CRLF", []string{"-H", "Authorization: Bearer " + secret + "\r\nX-Injected: 1"}},
+			{"embedded LF", []string{"-H", "X-Token: " + secret + "\nX-Injected: 1"}},
+			{"reserved repeated header marker", []string{"-H", "X-Cli-Repeated-Headers: X-A"}},
+			{"timeout 0s", []string{"--timeout", "0s"}},
+			{"timeout -1s", []string{"--timeout", "-1s"}},
+			{"timeout abc", []string{"--timeout", "abc"}},
+		}
+		for _, tc := range badFlagCases {
+			for _, mode := range [][]string{nil, {"--dry-run", "-o", "json"}} {
+				args := append(append(plainArgs(mock.URL), tc.args...), mode...)
+				args = append(args, "files", "upload", src)
+				res := runCLI(t, t.TempDir(), nil, args...)
+				if code := exitCode(t, res); code != 2 {
+					t.Errorf("%s (%v): exit code = %d, want 2\nstderr: %s", tc.name, mode, code, res.stderr)
+				}
+				if strings.Contains(res.stderr, secret) || strings.Contains(res.stdout, secret) {
+					t.Errorf("%s (%v): leaked secret in output:\nstderr: %s\nstdout: %s", tc.name, mode, res.stderr, res.stdout)
+				}
+			}
+		}
+
+		for _, envTimeout := range []string{"0s", "-1s", "abc"} {
+			args := append(plainArgs(mock.URL), "files", "upload", src)
+			res := runCLI(t, t.TempDir(), map[string]string{"GEMINI_TIMEOUT": envTimeout}, args...)
+			if code := exitCode(t, res); code != 2 {
+				t.Errorf("GEMINI_TIMEOUT=%q: exit code = %d, want 2\nstderr: %s", envTimeout, code, res.stderr)
+			}
+		}
+
+		home := t.TempDir()
+		cfgDir := filepath.Join(home, ".config", "gemini-api")
+		if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte("version: 1\ntimeout: 0s\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfgRes := runCLI(t, home, nil, append(plainArgs(mock.URL), "files", "upload", src)...)
+		if code := exitCode(t, cfgRes); code != 2 {
+			t.Errorf("config timeout 0s: exit code = %d, want 2\nstderr: %s", code, cfgRes.stderr)
+		}
+		overrideRes := runCLI(t, home, nil, append(plainArgs(mock.URL), "--timeout", "30s", "--dry-run", "-o", "json", "files", "upload", src)...)
+		if overrideRes.err != nil {
+			t.Errorf("--timeout 30s flag should override config timeout 0s: %v\nstderr: %s", overrideRes.err, overrideRes.stderr)
+		}
+
+		for _, badURL := range []string{"ftp://x", "https://"} {
+			for _, mode := range [][]string{nil, {"--dry-run", "-o", "json"}} {
+				args := append(append(plainArgs(badURL), mode...), "files", "upload", src)
+				res := runCLI(t, t.TempDir(), nil, args...)
+				if code := exitCode(t, res); code != 2 {
+					t.Errorf("--server-url %q (%v): exit code = %d, want 2\nstderr: %s", badURL, mode, code, res.stderr)
+				}
+			}
+		}
+
+		if got := len(mock.recorded()); got != 0 {
+			t.Errorf("validation failures sent %d requests, want 0", got)
+		}
+	})
 }
 
 // TestFilesUploadTimeout: --timeout bounds each request including its body. A
@@ -715,6 +851,331 @@ func TestFilesUploadWaitEdges(t *testing.T) {
 		}
 		if !strings.Contains(result.stderr, "file vanished") || result.stdout != "" {
 			t.Errorf("stdout = %q, stderr = %q", result.stdout, result.stderr)
+		}
+	})
+
+	t.Run("prompt active and delayed processing then delayed active before deadline", func(t *testing.T) {
+		// Prompt ACTIVE on first poll.
+		mockPrompt := newUploadMock(t)
+		mockPrompt.respond = func(w http.ResponseWriter, r uploadRequest) bool {
+			switch r.command {
+			case "upload, finalize":
+				finalizeProcessing(w)
+			case "":
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"name":"files/xyz789","mimeType":"video/mp4","state":"ACTIVE"}`)
+			default:
+				return false
+			}
+			return true
+		}
+		src := writeTempFile(t, "clip.mp4", "some video bytes")
+		resPrompt := runCLI(t, t.TempDir(), nil, append(plainArgs(mockPrompt.URL), "files", "upload", src, "--wait", "--wait-timeout", "3s")...)
+		if resPrompt.err != nil {
+			t.Fatalf("prompt active upload failed: %v\nstderr: %s", resPrompt.err, resPrompt.stderr)
+		}
+		if got := strings.TrimSpace(resPrompt.stdout); got != "files/xyz789" {
+			t.Errorf("stdout = %q, want files/xyz789", got)
+		}
+
+		// Delayed PROCESSING on poll 1, then delayed ACTIVE on poll 2 before the deadline.
+		mockDelayed := newUploadMock(t)
+		mockDelayed.respond = func(w http.ResponseWriter, r uploadRequest) bool {
+			switch r.command {
+			case "upload, finalize":
+				finalizeProcessing(w)
+			case "":
+				time.Sleep(150 * time.Millisecond)
+				w.Header().Set("Content-Type", "application/json")
+				if len(polls(mockDelayed)) == 1 {
+					fmt.Fprint(w, `{"name":"files/xyz789","mimeType":"video/mp4","state":"PROCESSING"}`)
+				} else {
+					fmt.Fprint(w, `{"name":"files/xyz789","mimeType":"video/mp4","state":"ACTIVE"}`)
+				}
+			default:
+				return false
+			}
+			return true
+		}
+		resDelayed := runCLI(t, t.TempDir(), nil, append(plainArgs(mockDelayed.URL), "files", "upload", src, "--wait", "--wait-timeout", "4s")...)
+		if resDelayed.err != nil {
+			t.Fatalf("delayed active upload failed: %v\nstderr: %s", resDelayed.err, resDelayed.stderr)
+		}
+		if got := strings.TrimSpace(resDelayed.stdout); got != "files/xyz789" {
+			t.Errorf("stdout = %q, want files/xyz789", got)
+		}
+		if got := len(polls(mockDelayed)); got != 2 {
+			t.Errorf("polls = %d, want 2", got)
+		}
+	})
+
+	t.Run("hanging poll exits near wait-timeout with wait-timeout message and never late success", func(t *testing.T) {
+		mock := newUploadMock(t)
+		mock.respond = func(w http.ResponseWriter, r uploadRequest) bool {
+			switch r.command {
+			case "upload, finalize":
+				finalizeProcessing(w)
+			case "":
+				select {
+				case <-r.ctx.Done():
+					return true
+				case <-time.After(8 * time.Second):
+					w.Header().Set("Content-Type", "application/json")
+					fmt.Fprint(w, `{"name":"files/xyz789","mimeType":"video/mp4","state":"ACTIVE"}`)
+				}
+			default:
+				return false
+			}
+			return true
+		}
+		src := writeTempFile(t, "clip.mp4", "some video bytes")
+		start := time.Now()
+		result := runCLI(t, t.TempDir(), nil, append(plainArgs(mock.URL), "files", "upload", src, "--wait", "--wait-timeout", "3s")...)
+		elapsed := time.Since(start)
+		if code := exitCode(t, result); code != 1 {
+			t.Fatalf("exit code = %d, want 1\nstdout: %s\nstderr: %s", code, result.stdout, result.stderr)
+		}
+		if elapsed >= 6*time.Second {
+			t.Errorf("elapsed = %v, want near 3s wait-timeout (< 6s)", elapsed)
+		}
+		if !strings.Contains(result.stderr, "files/xyz789 did not become ACTIVE within 3s") {
+			t.Errorf("stderr = %q, want wait-timeout message", result.stderr)
+		}
+		if result.stdout != "" {
+			t.Errorf("stdout = %q, want empty", result.stdout)
+		}
+	})
+
+	t.Run("earlier per-request --timeout 1s is not relabeled as --wait-timeout 3s expiry", func(t *testing.T) {
+		mock := newUploadMock(t)
+		mock.respond = func(w http.ResponseWriter, r uploadRequest) bool {
+			switch r.command {
+			case "upload, finalize":
+				finalizeProcessing(w)
+			case "":
+				select {
+				case <-r.ctx.Done():
+					return true
+				case <-time.After(5 * time.Second):
+				}
+			default:
+				return false
+			}
+			return true
+		}
+		src := writeTempFile(t, "clip.mp4", "some video bytes")
+		start := time.Now()
+		result := runCLI(t, t.TempDir(), nil, append(plainArgs(mock.URL), "--timeout", "1s", "files", "upload", src, "--wait", "--wait-timeout", "3s")...)
+		elapsed := time.Since(start)
+		if code := exitCode(t, result); code != 1 {
+			t.Fatalf("exit code = %d, want 1\nstderr: %s", code, result.stderr)
+		}
+		if elapsed >= 2500*time.Millisecond {
+			t.Errorf("elapsed = %v, want near 1s request timeout (< 2.5s)", elapsed)
+		}
+		if strings.Contains(result.stderr, "did not become ACTIVE within") {
+			t.Errorf("earlier --timeout 1s was relabeled as wait-timeout expiry:\n%s", result.stderr)
+		}
+	})
+
+	t.Run("dry-run with --wait and --wait-timeout preserves preview without polling or network", func(t *testing.T) {
+		mock := newUploadMock(t)
+		src := writeTempFile(t, "sample.txt", "hello world\n")
+		args := append(plainArgs(mock.URL), "--dry-run", "-o", "json", "files", "upload", src, "--wait", "--wait-timeout", "3s")
+		res := runCLI(t, t.TempDir(), nil, args...)
+		if res.err != nil {
+			t.Fatalf("dry-run failed: %v\nstderr: %s", res.err, res.stderr)
+		}
+		if got := len(mock.recorded()); got != 0 {
+			t.Errorf("dry-run sent %d network requests, want 0", got)
+		}
+		lines := strings.Split(strings.TrimSpace(res.stdout), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("dry-run preview lines = %d, want 2 (start + chunk):\n%s", len(lines), res.stdout)
+		}
+	})
+}
+
+func TestRawHTTPAndSDKUserAgentIdentityAndOverrides(t *testing.T) {
+	wantUA := fmt.Sprintf("google-genai-cli/%s gl-go/%s", cli.Version, runtime.Version())
+	workDir := t.TempDir()
+	samplePath := writeTempFile(t, "sample.txt", "hello world\n")
+
+	t.Run("default User-Agent matches across files upload, environments files upload/download, and SDK commands", func(t *testing.T) {
+		filesMock := newUploadMock(t)
+		res := runCLI(t, t.TempDir(), nil, append(plainArgs(filesMock.URL), "files", "upload", samplePath)...)
+		if res.err != nil {
+			t.Fatalf("files upload failed: %v\nstderr: %s", res.err, res.stderr)
+		}
+		filesReqs := filesMock.recorded()
+		if len(filesReqs) != 2 {
+			t.Fatalf("files upload requests = %d, want 2", len(filesReqs))
+		}
+		for i, r := range filesReqs {
+			if got := r.headers.Get("User-Agent"); got != wantUA {
+				t.Errorf("files upload req[%d] (%s) User-Agent = %q, want %q", i, r.command, got, wantUA)
+			}
+		}
+
+		envUploadMock := newEnvironmentUploadMock(t, storesEverything("sample.txt"))
+		envRes := runCLI(t, t.TempDir(), nil, environmentUploadArgs()(envUploadMock.URL, samplePath)...)
+		if envRes.err != nil {
+			t.Fatalf("environments files upload failed: %v\nstderr: %s", envRes.err, envRes.stderr)
+		}
+		envReqs := envUploadMock.recorded()
+		if len(envReqs) != 2 {
+			t.Fatalf("environments files upload requests = %d, want 2", len(envReqs))
+		}
+		for i, r := range envReqs {
+			if got := r.headers.Get("User-Agent"); got != wantUA {
+				t.Errorf("environments files upload req[%d] (%s) User-Agent = %q, want %q", i, r.command, got, wantUA)
+			}
+		}
+
+		var gotDownloadUA, gotModelsUA string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1beta/environments/env_abc/files/remote.txt":
+				gotDownloadUA = r.Header.Get("User-Agent")
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write([]byte("content\n"))
+			case "/v1beta/models":
+				gotModelsUA = r.Header.Get("User-Agent")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"models":[]}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		dlOut := filepath.Join(workDir, "downloaded.txt")
+		dlRes := runCLI(t, t.TempDir(), nil, append(plainArgs(srv.URL), "environments", "files", "download", "env_abc", "remote.txt", "--out", dlOut)...)
+		if dlRes.err != nil {
+			t.Fatalf("environments files download failed: %v\nstderr: %s", dlRes.err, dlRes.stderr)
+		}
+		if gotDownloadUA != wantUA {
+			t.Errorf("environments files download User-Agent = %q, want %q", gotDownloadUA, wantUA)
+		}
+
+		modelsRes := runCLI(t, t.TempDir(), nil, append(plainArgs(srv.URL), "models", "list")...)
+		if modelsRes.err != nil {
+			t.Fatalf("models list failed: %v\nstderr: %s", modelsRes.err, modelsRes.stderr)
+		}
+		if gotModelsUA != wantUA {
+			t.Errorf("models list User-Agent = %q, want %q", gotModelsUA, wantUA)
+		}
+	})
+
+	t.Run("explicit --header User-Agent override and header precedence", func(t *testing.T) {
+		const customUA = "custom-cli-caller/9.9"
+		filesMock := newUploadMock(t)
+		res := runCLI(t, t.TempDir(), nil, append(
+			plainArgs(filesMock.URL),
+			"-H", "User-Agent: "+customUA,
+			"-H", "Authorization: Bearer custom-tok",
+			"-H", "X-Custom: a",
+			"-H", "x-custom: b",
+			"files", "upload", samplePath,
+		)...)
+		if res.err != nil {
+			t.Fatalf("files upload with custom headers failed: %v\nstderr: %s", res.err, res.stderr)
+		}
+		for i, r := range filesMock.recorded() {
+			if got := r.headers.Get("User-Agent"); got != customUA {
+				t.Errorf("files upload req[%d] User-Agent = %q, want %q", i, got, customUA)
+			}
+			// Explicit Authorization header still displaces API key.
+			if gotAuth := r.headers.Get("Authorization"); gotAuth != "Bearer custom-tok" {
+				t.Errorf("files upload req[%d] Authorization = %q, want Bearer custom-tok", i, gotAuth)
+			}
+			if gotKey := r.headers.Get("X-Goog-Api-Key"); gotKey != "" {
+				t.Errorf("files upload req[%d] X-Goog-Api-Key = %q, want displaced (empty)", i, gotKey)
+			}
+			if gotCustom := r.headers.Values("X-Custom"); !slices.Equal(gotCustom, []string{"a", "b"}) {
+				t.Errorf("files upload req[%d] X-Custom = %v, want [a b]", i, gotCustom)
+			}
+		}
+
+		var gotDownloadUA string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotDownloadUA = r.Header.Get("User-Agent")
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("ok\n"))
+		}))
+		defer srv.Close()
+
+		dlOut := filepath.Join(workDir, "downloaded-override.txt")
+		dlRes := runCLI(t, t.TempDir(), nil, append(
+			plainArgs(srv.URL),
+			"-H", "user-agent: "+customUA,
+			"environments", "files", "download", "env_abc", "remote.txt", "--out", dlOut,
+		)...)
+		if dlRes.err != nil {
+			t.Fatalf("download with custom User-Agent failed: %v\nstderr: %s", dlRes.err, dlRes.stderr)
+		}
+		if gotDownloadUA != customUA {
+			t.Errorf("download custom User-Agent = %q, want %q", gotDownloadUA, customUA)
+		}
+	})
+
+	t.Run("dry-run JSON previews render current User-Agent with zero network calls and no file writes", func(t *testing.T) {
+		var sinkCalls atomic.Int32
+		sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sinkCalls.Add(1)
+		}))
+		defer sink.Close()
+
+		dryDir := t.TempDir()
+		previewCases := []struct {
+			name      string
+			tail      []string
+			wantLines int
+		}{
+			{"files upload", []string{"files", "upload", samplePath, "--dry-run", "-o", "json"}, 2},
+			{"environments files upload", []string{"environments", "files", "upload", "env_abc", samplePath, "--dry-run", "-o", "json"}, 2},
+			{"environments files download", []string{"environments", "files", "download", "env_abc", "remote.txt", "--dry-run", "-o", "json"}, 1},
+		}
+
+		for _, tc := range previewCases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := runCLIInDir(t, t.TempDir(), dryDir, nil, append(plainArgs(sink.URL), tc.tail...)...)
+				if res.err != nil {
+					t.Fatalf("dry-run failed: %v\nstderr: %s", res.err, res.stderr)
+				}
+				lines := strings.Split(strings.TrimSpace(res.stdout), "\n")
+				if len(lines) != tc.wantLines {
+					t.Fatalf("preview lines = %d, want %d:\n%s", len(lines), tc.wantLines, res.stdout)
+				}
+				for i, line := range lines {
+					var preview struct {
+						DryRun  bool `json:"dry_run"`
+						Request struct {
+							Headers map[string][]string `json:"headers"`
+						} `json:"request"`
+					}
+					if err := json.Unmarshal([]byte(line), &preview); err != nil {
+						t.Fatalf("line %d unmarshal: %v\nraw: %s", i, err, line)
+					}
+					if !preview.DryRun {
+						t.Errorf("line %d dry_run = false, want true", i)
+					}
+					if gotUA := preview.Request.Headers["User-Agent"]; !slices.Equal(gotUA, []string{wantUA}) {
+						t.Errorf("line %d User-Agent = %v, want [%s]", i, gotUA, wantUA)
+					}
+					if gotKey := preview.Request.Headers["X-Goog-Api-Key"]; !slices.Equal(gotKey, []string{"[REDACTED]"}) {
+						t.Errorf("line %d X-Goog-Api-Key = %v, want [[REDACTED]]", i, gotKey)
+					}
+				}
+			})
+		}
+
+		if got := sinkCalls.Load(); got != 0 {
+			t.Errorf("sink received %d requests during dry-run previews, want 0", got)
+		}
+		entries, err := os.ReadDir(dryDir)
+		if err != nil || len(entries) != 0 {
+			t.Errorf("dry-run wrote files into working directory: %v (err=%v)", entries, err)
 		}
 	})
 }

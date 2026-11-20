@@ -30,7 +30,7 @@ import (
 var createCmdMeta = []flagutil.FlagMeta{
 	{FlagName: "agent-config", Shorthand: "a", FieldPath: "Body.AgentConfig", Kind: flagutil.FlagKindUnion, Union: &flagutil.UnionMeta{Discriminated: false, Optional: true, TypeDescription: "JSON value (one of: { \"max_total_tokens\": string, \"model\": string })"}},
 	{FlagName: "base-agent", FieldPath: "Body.BaseAgent", Kind: flagutil.FlagKindString, Required: true, Description: "The base agent to extend. [required]"},
-	{FlagName: "base-environment", FieldPath: "Body.BaseEnvironment", Kind: flagutil.FlagKindUnion, Union: &flagutil.UnionMeta{Discriminated: false, Optional: true, TypeDescription: "JSON value (one of: { \"env\": object, \"environment_id\": string, \"network\": object | string, \"sources\": object[] } | string)"}},
+	{FlagName: "base-environment", FieldPath: "Body.BaseEnvironment", Kind: flagutil.FlagKindUnion, Union: &flagutil.UnionMeta{Discriminated: false, Optional: true, TypeDescription: "JSON value (one of: { \"custom_config\": object, \"env\": object, \"environment_id\": string, \"mode\": string, ... } | string)"}},
 	{FlagName: "description", FieldPath: "Body.Description", Kind: flagutil.FlagKindString, Optional: true, Description: "Agent description for developers to quickly read and understand."},
 	{FlagName: "id", Shorthand: "i", FieldPath: "Body.ID", Kind: flagutil.FlagKindString, Required: true, Description: "The unique identifier for the agent. [required]"},
 	{FlagName: "system-instruction", Shorthand: "s", FieldPath: "Body.SystemInstruction", Kind: flagutil.FlagKindString, Optional: true, Description: "System instruction for the agent."},
@@ -43,7 +43,7 @@ func initCreateCmd(parent *cobra.Command) error {
 		Use:     "create",
 		Short:   "Create a managed agent definition",
 		Long:    "Creates a managed agent definition that extends a base agent.",
-		Example: "  gemini-api agent create --base-agent antigravity-preview-05-2026 --id research-assistant",
+		Example: "  gemini-api agent create --base-agent antigravity-preview-09-2026 --id research-assistant",
 		Args:    cobra.NoArgs,
 		RunE:    runCreateCmd,
 		Annotations: map[string]string{

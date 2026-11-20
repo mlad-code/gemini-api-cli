@@ -130,6 +130,30 @@ func resolveOutputFormat(cmd *cobra.Command) string {
 	return flagutil.ResolveOutputFormat(cmd, config.GetString("output-format"), IsAgentMode())
 }
 
+// configuredTimeout returns the timeout setting: --timeout, then env/config.
+func configuredTimeout(cmd *cobra.Command) string {
+	if value, changed := flagutil.GetStringFlag(cmd, "timeout"); changed && value != "" {
+		return value
+	}
+	return config.GetString("timeout")
+}
+
+// EffectiveOutputFormat returns the format the command renders with.
+func EffectiveOutputFormat(cmd *cobra.Command) string {
+	return resolveOutputFormat(cmd)
+}
+
+// PinOutputFormat fixes the output format until the returned func is called,
+// so a command that rewrites the saved default still renders in the format it
+// started with.
+func PinOutputFormat(cmd *cobra.Command) func() {
+	previous := preparsedRendering.outputFormat
+	if previous == "" {
+		preparsedRendering.outputFormat = resolveOutputFormat(cmd)
+	}
+	return func() { preparsedRendering.outputFormat = previous }
+}
+
 // A config file value is a saved default, not a per-invocation choice, so it
 // never counts as explicit even though resolveOutputFormat still honours it.
 func outputFormatExplicit(cmd *cobra.Command) bool {
@@ -183,8 +207,16 @@ func decodeWithNumbers(data []byte) (interface{}, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var parsed interface{}
-	err := dec.Decode(&parsed)
-	return parsed, err
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			err = errors.New("invalid character after top-level value")
+		}
+		return nil, err
+	}
+	return parsed, nil
 }
 
 func convertNumbers(v interface{}, conv func(json.Number) interface{}) interface{} {
@@ -332,18 +364,23 @@ func renderPathEnvelope(cmd *cobra.Command, absPath string, envelope map[string]
 }
 
 // PrepareCallOpts builds common SDK call options from CLI flags.
-// Parses --header flags into operations.WithSetHeaders options.
+// Parses --header flags into operations.WithSetHeaders options carrying each
+// header's first value; client.NewClient sends the remaining values of a
+// repeated header.
 // Server resolution and skip-deserialization are handled per-operation.
 func PrepareCallOpts(cmd *cobra.Command) ([]operations.Option, error) {
 	var opts []operations.Option
 	if hdrs, _ := flagutil.GetStringArrayFlag(cmd, "header"); len(hdrs) > 0 {
-		headerMap := make(map[string]string, len(hdrs))
-		for _, h := range hdrs {
-			k, v, ok := strings.Cut(h, ":")
-			if !ok {
-				return nil, flagutil.WithCLIValidation(fmt.Errorf("invalid header format %q: expected \"Key: Value\"", h))
-			}
-			headerMap[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		headers, err := flagutil.ParseHeaderFlags(hdrs)
+		if err != nil {
+			return nil, err
+		}
+		headerMap := make(map[string]string, len(headers))
+		for name, values := range headers {
+			headerMap[name] = values[0]
+		}
+		if len(flagutil.RepeatedHeaders(headers)) > 0 {
+			headerMap[flagutil.RepeatedHeadersMarker] = "1"
 		}
 		opts = append(opts, operations.WithSetHeaders(headerMap))
 	}
@@ -395,6 +432,20 @@ func LocalResult(cmd *cobra.Command, res interface{}) error {
 }
 
 func result(cmd *cobra.Command, res interface{}, allowArtifact bool) error {
+	failure := outcomeResultFailure(cmd, res)
+	if failure != nil && allowArtifact && activeArtifact(cmd) != nil {
+		return Error(cmd, failure)
+	}
+	if err := renderResult(cmd, res, allowArtifact); err != nil {
+		return err
+	}
+	if failure != nil {
+		return Error(cmd, failure)
+	}
+	return nil
+}
+
+func renderResult(cmd *cobra.Command, res interface{}, allowArtifact bool) error {
 	out := cmd.OutOrStdout()
 	colorFlag, _ := flagutil.GetStringFlag(cmd, "color")
 	colorize := ShouldColorize(colorFlag)
@@ -435,8 +486,7 @@ func result(cmd *cobra.Command, res interface{}, allowArtifact bool) error {
 		if len(rawBody) > 0 {
 			if includeHeaders {
 				headers := extractResponseHeaders(res)
-				var parsed interface{}
-				if err := json.Unmarshal(rawBody, &parsed); err == nil {
+				if parsed, err := decodeWithNumbers(rawBody); err == nil {
 					merged := injectHeaders(parsed, headers)
 					if jqExpr != "" {
 						return applyJqToTyped(out, merged, jqExpr, colorize, jqRaw)
@@ -485,9 +535,13 @@ func result(cmd *cobra.Command, res interface{}, allowArtifact bool) error {
 		if format == "json" || format == "yaml" || format == "toon" || jqExpr != "" {
 			return outputWithHeaders(out, content, headers, format, jqExpr, colorize, jqRaw)
 		}
-		// Pretty mode: print body content, then headers section
+		// Pretty and table modes: print body content, then headers section
 		if content != nil {
-			if err := prettyPrint(out, content, colorize); err != nil {
+			if format == "table" {
+				if err := printTable(out, content); err != nil {
+					return err
+				}
+			} else if err := prettyPrint(out, content, colorize); err != nil {
 				return err
 			}
 		}
@@ -550,11 +604,40 @@ func renderClassifiedError(cmd *cobra.Command, err error, classification Classif
 		return err
 	}
 	if structured {
-		renderStructuredError(cmd, err, classification)
+		renderStructuredError(cmd, cmd.ErrOrStderr(), err, classification)
 	} else {
-		renderPrettyError(cmd, err, classification)
+		var buf bytes.Buffer
+		renderPrettyError(cmd, &buf, err, classification)
+		writeScrubbed(cmd.ErrOrStderr(), buf.String())
 	}
 	return markRendered(err, classification)
+}
+
+// writeScrubbed masks resolved credentials, which an API or transport error
+// can echo back, before error output reaches the terminal.
+func writeScrubbed(out io.Writer, rendered string) {
+	fmt.Fprint(out, config.ScrubSecrets(rendered))
+}
+
+// printScrubbedJSON masks resolved credentials in the decoded values rather
+// than the serialized text: a credential nested in a string is escaped once
+// more than the registered forms, and masking inside a number breaks the JSON.
+func printScrubbedJSON(out io.Writer, jsonData []byte, colorize bool) {
+	printJSON(out, scrubJSONDocument(jsonData), colorize)
+}
+
+func scrubJSONDocument(data []byte) []byte {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var value interface{}
+	if err := dec.Decode(&value); err != nil {
+		return []byte(config.ScrubSecrets(string(data)))
+	}
+	scrubbed, err := json.MarshalIndent(config.ScrubSecretValues(value), "", "  ")
+	if err != nil {
+		return []byte(config.ScrubSecrets(string(data)))
+	}
+	return scrubbed
 }
 
 // renderUnclassifiedAPIError is the compatibility rendering path used when
@@ -565,15 +648,16 @@ func renderUnclassifiedAPIError(cmd *cobra.Command, err error, classification Cl
 		return err
 	}
 	if structured {
-		renderUnclassifiedStructuredAPIError(cmd, err, classification)
+		renderUnclassifiedStructuredAPIError(cmd, cmd.ErrOrStderr(), err, classification)
 	} else {
-		renderUnclassifiedPrettyAPIError(cmd, err, classification)
+		var buf bytes.Buffer
+		renderUnclassifiedPrettyAPIError(cmd, &buf, err, classification)
+		writeScrubbed(cmd.ErrOrStderr(), buf.String())
 	}
 	return markRendered(err, classification)
 }
 
-func renderUnclassifiedPrettyAPIError(cmd *cobra.Command, err error, classification Classification) {
-	out := cmd.ErrOrStderr()
+func renderUnclassifiedPrettyAPIError(cmd *cobra.Command, out io.Writer, err error, classification Classification) {
 	if wantsHeaders(cmd) {
 		headers := extractErrorResponseHeaders(err)
 		if len(headers) > 0 {
@@ -596,7 +680,7 @@ func renderUnclassifiedPrettyAPIError(cmd *cobra.Command, err error, classificat
 	}
 }
 
-func renderUnclassifiedStructuredAPIError(cmd *cobra.Command, err error, classification Classification) {
+func renderUnclassifiedStructuredAPIError(cmd *cobra.Command, out io.Writer, err error, classification Classification) {
 	statusCode := classification.StatusCode
 	body := classification.RawBody
 	var envelope interface{}
@@ -660,11 +744,10 @@ func renderUnclassifiedStructuredAPIError(cmd *cobra.Command, err error, classif
 		jsonData, _ = json.MarshalIndent(map[string]interface{}{"error": err.Error(), "exit_code": ExitCodeFor(classification)}, "", "  ")
 	}
 	colorFlag, _ := flagutil.GetStringFlag(cmd, "color")
-	printJSON(cmd.ErrOrStderr(), jsonData, ShouldColorize(colorFlag))
+	printScrubbedJSON(out, jsonData, ShouldColorize(colorFlag))
 }
 
-func renderPrettyError(cmd *cobra.Command, err error, classification Classification) {
-	out := cmd.ErrOrStderr()
+func renderPrettyError(cmd *cobra.Command, out io.Writer, err error, classification Classification) {
 	if wantsHeaders(cmd) {
 		headers := extractErrorResponseHeaders(err)
 		if len(headers) > 0 {
@@ -695,7 +778,7 @@ func renderPrettyError(cmd *cobra.Command, err error, classification Classificat
 	}
 }
 
-func renderStructuredError(cmd *cobra.Command, err error, classification Classification) {
+func renderStructuredError(cmd *cobra.Command, out io.Writer, err error, classification Classification) {
 	envelope := classifiedErrorEnvelope(err, classification)
 	if wantsHeaders(cmd) {
 		envelope = injectHeaders(envelope, extractErrorResponseHeaders(err)).(map[string]interface{})
@@ -711,7 +794,7 @@ func renderStructuredError(cmd *cobra.Command, err error, classification Classif
 		}, "", "  ")
 	}
 	colorFlag, _ := flagutil.GetStringFlag(cmd, "color")
-	printJSON(cmd.ErrOrStderr(), jsonData, ShouldColorize(colorFlag))
+	printScrubbedJSON(out, jsonData, ShouldColorize(colorFlag))
 }
 
 func classifiedErrorEnvelope(err error, classification Classification) map[string]interface{} {
@@ -1204,7 +1287,7 @@ func outputWithHeaders(out io.Writer, content interface{}, headers http.Header, 
 		if err != nil {
 			return err
 		}
-		if err := json.Unmarshal(data, &parsed); err != nil {
+		if parsed, err = decodeWithNumbers(data); err != nil {
 			return err
 		}
 	}
@@ -1217,7 +1300,7 @@ func outputWithHeaders(out io.Writer, content interface{}, headers http.Header, 
 
 	switch format {
 	case "yaml":
-		yamlData, err := yaml.Marshal(merged)
+		yamlData, err := yaml.Marshal(convertNumbers(merged, yamlNumber))
 		if err != nil {
 			return fmt.Errorf("failed to marshal response as YAML: %w", err)
 		}
@@ -1241,6 +1324,10 @@ func outputWithHeaders(out io.Writer, content interface{}, headers http.Header, 
 // printResponseHeadersPretty prints HTTP response headers in aligned key-value
 // format, similar to prettyPrint but as a separate section.
 func printResponseHeadersPretty(w io.Writer, headers http.Header, colorize bool) {
+	printResponseHeadersPrettyLabel(w, headers, colorize, "Response Headers")
+}
+
+func printResponseHeadersPrettyLabel(w io.Writer, headers http.Header, colorize bool, label string) {
 	if len(headers) == 0 {
 		return
 	}
@@ -1261,7 +1348,6 @@ func printResponseHeadersPretty(w io.Writer, headers http.Header, colorize bool)
 	}
 
 	fmt.Fprintln(w)
-	label := "Response Headers"
 	if colorize {
 		label = colorKey + label + colorReset
 	}
@@ -1300,8 +1386,8 @@ func outputJqResults(out io.Writer, results []interface{}, colorize, raw bool) e
 
 // applyJqToRawJSON applies a jq expression to raw JSON bytes.
 func applyJqToRawJSON(out io.Writer, rawBody []byte, jqExpr string, colorize, raw bool) error {
-	var data interface{}
-	if err := json.Unmarshal(rawBody, &data); err != nil {
+	data, err := decodeWithNumbers(rawBody)
+	if err != nil {
 		return fmt.Errorf("failed to parse response JSON for jq: %w", err)
 	}
 	results, err := ApplyJqFilter(data, jqExpr)

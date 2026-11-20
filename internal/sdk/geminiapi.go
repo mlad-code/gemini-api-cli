@@ -95,6 +95,8 @@ type GeminiAPI struct {
 	Models *Models
 	// Schedule and manage cron triggers that run managed agents
 	Triggers *Triggers
+	// Design, replicate, list, inspect, and delete voices
+	Voices *Voices
 	// Manage webhook endpoints and signing secrets for event delivery
 	Webhooks *Webhooks
 
@@ -193,10 +195,10 @@ func WithTimeout(timeout time.Duration) SDKOption {
 // New creates a new instance of the SDK with the provided options
 func New(opts ...SDKOption) *GeminiAPI {
 	sdk := &GeminiAPI{
-		SDKVersion: "0.4.4",
+		SDKVersion: "0.5.0",
 		sdkConfiguration: config.SDKConfiguration{
-			UserAgent:         "speakeasy-sdk/go 0.4.4 internal v1beta google3/third_party/gemini_api_cli/internal/sdk",
-			SDKVersion:        "0.4.4",
+			UserAgent:         "speakeasy-sdk/go 0.5.0 internal v1beta google3/third_party/gemini_api_cli/internal/sdk",
+			SDKVersion:        "0.5.0",
 			GenVersion:        "internal",
 			OpenAPIDocVersion: "v1beta",
 			Globals:           globals.Globals{},
@@ -221,6 +223,7 @@ func New(opts ...SDKOption) *GeminiAPI {
 	sdk.Files = newFiles(sdk, sdk.sdkConfiguration, sdk.hooks)
 	sdk.Models = newModels(sdk, sdk.sdkConfiguration, sdk.hooks)
 	sdk.Triggers = newTriggers(sdk, sdk.sdkConfiguration, sdk.hooks)
+	sdk.Voices = newVoices(sdk, sdk.sdkConfiguration, sdk.hooks)
 	sdk.Webhooks = newWebhooks(sdk, sdk.sdkConfiguration, sdk.hooks)
 
 	return sdk

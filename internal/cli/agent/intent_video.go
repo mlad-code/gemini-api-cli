@@ -34,7 +34,7 @@ import (
 func InitIntentVideo(parent *cobra.Command) error {
 	cmd := &cobra.Command{
 		Use:     "video [prompt]",
-		Short:   "Generate & edit video conversationally (gemini-omni-1.1-flash)",
+		Short:   "Generate & edit video conversationally (gemini-omni-1.2-flash)",
 		Long:    "Generate video via the Interactions API (video response modality); polls \"agent status\" with backoff\nuntil completion, writes the video (--out or default path), and prints the path (--raw-response for raw\nJSON; --async returns the ID to resume with \"gemini-api video --resume <id>\"; requires_action prints as-is).\n\nArguments:\n  <prompt>  Video prompt",
 		Example: "  gemini-api video \"now pan to the left\" --previous-interaction-id v1_ChdPU0F4YWFtNkFwS2kxZThQZ05lbXdROBIXT1NBeGFhbTZBcEtpMWU4UGdOZW13UTg\n  gemini-api video \"a timelapse of a city at night\" --async\n  gemini-api video \"ocean waves at dawn\" --aspect-ratio 9:16 --resolution 1080p --out clips/waves.mp4",
 		Args:    cobra.ArbitraryArgs,
@@ -43,11 +43,11 @@ func InitIntentVideo(parent *cobra.Command) error {
 			"speakeasy_operation":            "CreateInteraction",
 			flagutil.AnnotationWholeBodyFlag: "body",
 			"speakeasy_strict_body_keys":     "true",
-			"speakeasy_help_defaults":        "model gemini-omni-1.1-flash · polls until done, writes ./gemini-video-<ts>.mp4 (--async returns the interaction ID)",
-			"speakeasy_help_learn":           "https://ai.google.dev/gemini-api/docs/video",
+			"speakeasy_help_defaults":        "model gemini-omni-1.2-flash · polls until done, writes ./gemini-video-<ts>.mp4 (--async returns the interaction ID)",
+			"speakeasy_help_learn":           "https://aistudio.google.com/docs/video",
 			"speakeasy_help_escalate":        "full request control via gemini-api agent run",
 			"speakeasy_artifact":             "{\"pointer\":[{\"field\":\"steps\"},{\"wild\":true},{\"field\":\"content\"},{\"wild\":true}],\"kind\":\"video\",\"defaultPath\":\"gemini-video-{timestamp}-{rand}.{ext}\"}",
-			"speakeasy_async":                "{\"idPointer\":\"/id\",\"statePointer\":\"/status\",\"states\":{\"budget_exceeded\":\"failure\",\"cancelled\":\"failure\",\"completed\":\"success\",\"failed\":\"failure\",\"in_progress\":\"pending\",\"incomplete\":\"failure\",\"queued\":\"pending\",\"requires_action\":\"handoff\"},\"interval\":\"5s\",\"backoff\":1.5,\"maxInterval\":\"30s\",\"timeout\":\"15m\",\"command\":\"video\",\"resume\":\"gemini-api video --resume\",\"parameterIn\":\"path\",\"parameterName\":\"interactionsId\",\"params\":[{\"in\":\"query\",\"name\":\"stream\",\"value\":false}]}",
+			"speakeasy_async":                "{\"idPointer\":\"/id\",\"statePointer\":\"/status\",\"states\":{\"budget_exceeded\":\"failure\",\"cancelled\":\"failure\",\"completed\":\"success\",\"failed\":\"failure\",\"in_progress\":\"pending\",\"incomplete\":\"failure\",\"queued\":\"pending\",\"requires_action\":\"handoff\",\"requires_continuation\":\"pending\"},\"interval\":\"5s\",\"backoff\":1.5,\"maxInterval\":\"30s\",\"timeout\":\"15m\",\"command\":\"video\",\"resume\":\"gemini-api video --resume\",\"parameterIn\":\"path\",\"parameterName\":\"interactionsId\",\"params\":[{\"in\":\"query\",\"name\":\"stream\",\"value\":false}]}",
 		},
 	}
 	intentMeta := flagutil.NonBodyMeta(runCmdMeta, "Body")
@@ -66,7 +66,7 @@ func InitIntentVideo(parent *cobra.Command) error {
 
 		BodySources: []string{"body"},
 	})
-	cmd.Flags().StringP("model", "m", "", "Override the video model (e.g. gemini-omni-flash-preview, default: gemini-omni-1.1-flash)")
+	cmd.Flags().StringP("model", "m", "", "Override the video model (e.g. gemini-omni-1.1-flash, gemini-omni-flash-preview, default: gemini-omni-1.2-flash)")
 	flagutil.MarkRequestInput(cmd, "model")
 	_ = flagutil.AnnotatePromptFlag(cmd, "model", flagutil.PromptFlagSpec{
 		Required: false,
@@ -130,7 +130,7 @@ func InitIntentVideo(parent *cobra.Command) error {
 var intentVideoPreset = flagutil.PresetMerge{
 	Command: "video",
 	Variant: "ModelInteraction",
-	Preset:  "{\"background\":true,\"model\":\"gemini-omni-1.1-flash\",\"response_format\":{\"type\":\"video\"},\"stream\":false}",
+	Preset:  "{\"background\":true,\"model\":\"gemini-omni-1.2-flash\",\"response_format\":{\"type\":\"video\"},\"stream\":false}",
 	Foreign: []string{"agent"},
 	Nested: map[string]flagutil.PresetMergePoint{
 		"/response_format": {Key: "type", Values: []string{"\"video\""}},
@@ -143,7 +143,7 @@ func runIntentVideoCmd(cmd *cobra.Command, args []string) error {
 		return usage.EmitSchema(cmd, cmd.OutOrStdout())
 	}
 	if requested, _ := cmd.Flags().GetBool("schema"); requested {
-		return usage.EmitBodySchema(cmd.OutOrStdout(), "CreateInteraction")
+		return usage.EmitBodySchema(cmd.OutOrStdout(), "CreateInteraction#ModelInteraction")
 	}
 	if flagutil.FlagChanged(cmd, "raw-response") && flagutil.FlagChanged(cmd, "out") {
 		return flagutil.WithCLIValidation(fmt.Errorf("--raw-response prints the raw API response and cannot be combined with --out"))
@@ -265,6 +265,13 @@ func runIntentVideoCmd(cmd *cobra.Command, args []string) error {
 			if err := flagutil.MergePresetStdinBody(cmd, intentVideoPreset); err != nil {
 				return err
 			}
+		}
+	}
+	if bodySupplied {
+		if err := flagutil.RequireBodyInputs(cmd, suppliedBodyFlag, []flagutil.RequiredBodyInput{
+			{Path: []string{"input"}, Source: "the <prompt> argument"},
+		}); err != nil {
+			return err
 		}
 	}
 	if err := output.ValidateAsyncFlags(cmd); err != nil {

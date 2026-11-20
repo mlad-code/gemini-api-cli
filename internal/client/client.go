@@ -18,9 +18,11 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -57,6 +59,9 @@ func NewClient(cmd *cobra.Command, allowedSecurityFields ...string) (*sdk.Gemini
 		if err != nil {
 			return nil, flagutil.WithCLIValidation(fmt.Errorf("invalid --timeout value %q: %w", timeoutStr, err))
 		}
+		if timeout <= 0 {
+			return nil, flagutil.WithCLIValidation(fmt.Errorf("invalid --timeout value %q: must be a positive Go duration", timeoutStr))
+		}
 		sdkOpts = append(sdkOpts, sdk.WithTimeout(timeout))
 	} // Retry configuration
 	retryConfig, err := buildRetryConfig(cmd)
@@ -69,13 +74,96 @@ func NewClient(cmd *cobra.Command, allowedSecurityFields ...string) (*sdk.Gemini
 
 	// Diagnostics and test client composition.
 	// Order: test client (innermost) → diagnostics wrapper (outermost).
-	var httpClient HTTPClient = &http.Client{Transport: newPhaseBoundedTransport(cmd)}
+	var httpClient HTTPClient = &redirectGuardClient{&http.Client{Transport: newPhaseBoundedTransport(cmd), CheckRedirect: SameOriginRedirect}}
 	if testClient := testclient.NewTestHTTPClient(); testClient != nil {
 		httpClient = testClient
 	}
 	httpClient = WrapClientForDiagnostics(cmd, httpClient)
+	if hdrs, _ := flagutil.GetStringArrayFlag(cmd, "header"); len(hdrs) > 0 {
+		headers, err := flagutil.ParseHeaderFlags(hdrs)
+		if err != nil {
+			return nil, err
+		}
+		if repeated := flagutil.RepeatedHeaders(headers); len(repeated) > 0 {
+			httpClient = &repeatedHeaderClient{next: httpClient, headers: repeated}
+		}
+	}
 	sdkOpts = append(sdkOpts, sdk.WithClient(httpClient))
 	return sdk.New(sdkOpts...), nil
+}
+
+// repeatedHeaderClient sends every value of a header repeated with --header on
+// requests tagged with flagutil.RepeatedHeadersMarker.
+// operations.WithSetHeaders carries only one value per header.
+type repeatedHeaderClient struct {
+	next    HTTPClient
+	headers http.Header
+}
+
+func (c *repeatedHeaderClient) Do(req *http.Request) (*http.Response, error) {
+	if req.Header.Get(flagutil.RepeatedHeadersMarker) == "" {
+		return c.next.Do(req)
+	}
+	req = req.Clone(req.Context())
+	req.Header.Del(flagutil.RepeatedHeadersMarker)
+	for name, values := range c.headers {
+		req.Header[name] = append([]string(nil), values...)
+	}
+	return c.next.Do(req)
+}
+
+// SameOriginRedirect refuses redirects to another scheme or host, and
+// redirects that change the request method: net/http forwards custom
+// credential headers (API keys) across origins and turns a POST answered with
+// 301/302/303 into a bodiless GET.
+func SameOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	from := via[0].URL
+	if flagutil.URLOrigin(req.URL) != flagutil.URLOrigin(from) {
+		return &RedirectRefusedError{message: fmt.Sprintf("refusing to follow a redirect from %s://%s to %s://%s: credentials are only sent to the configured server", from.Scheme, from.Host, req.URL.Scheme, req.URL.Host)}
+	}
+	if prev := via[len(via)-1]; req.Method != prev.Method {
+		return &RedirectRefusedError{message: fmt.Sprintf("refusing to follow a redirect to %s that would send %s instead of %s: the server tried to convert the request", req.URL.Path, req.Method, prev.Method)}
+	}
+	return nil
+}
+
+// RedirectRefusedError is returned for a redirect the CLI declined to follow.
+type RedirectRefusedError struct {
+	message string
+}
+
+func (e *RedirectRefusedError) Error() string { return e.message }
+
+func (e *RedirectRefusedError) CLIRedirectRefused() bool { return true }
+
+func (e *RedirectRefusedError) CLIHints() []string {
+	return []string{"Point --server-url at the endpoint the server redirects to, so the request needs no redirect"}
+}
+
+func (e *RedirectRefusedError) CLIOmitTypeHints() bool { return true }
+
+// redirectGuardClient strips the query, fragment and userinfo from the
+// Location net/http attaches to a refused redirect, so tokens in it are never
+// printed in error or debug output.
+type redirectGuardClient struct {
+	*http.Client
+}
+
+func (c *redirectGuardClient) Do(req *http.Request) (*http.Response, error) {
+	res, err := c.Client.Do(req)
+	var urlErr *url.Error
+	var refused *RedirectRefusedError
+	if errors.As(err, &urlErr) && errors.As(err, &refused) {
+		if u, parseErr := url.Parse(urlErr.URL); parseErr == nil {
+			urlErr.URL = (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
+		} else {
+			urlErr.URL = "<redirect target>"
+		}
+	}
+	return res, err
 }
 
 func newPhaseBoundedTransport(cmd *cobra.Command) http.RoundTripper {

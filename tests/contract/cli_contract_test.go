@@ -166,15 +166,18 @@ func TestImageArtifactOutput(t *testing.T) {
 		t.Errorf("request presets = %+v, want image model + image response format", sent)
 	}
 
-	// --out file: extension follows the returned MIME type; overwrite is silent.
+	// --out file: explicit path with a recognized media extension is kept as given,
+	// with a mismatch note when the returned MIME type differs; overwrite is silent.
 	target := filepath.Join(dir, "shots", "hero.jpg")
 	result = pretty(dir, "--out", target)
 	if result.err != nil {
 		t.Fatalf("image --out failed: %v\nstderr: %s", result.err, result.stderr)
 	}
-	wantPath := filepath.Join(dir, "shots", "hero.png")
-	if strings.TrimSpace(result.stdout) != wantPath {
-		t.Errorf("--out path = %q, want %q (extension follows image/png)", strings.TrimSpace(result.stdout), wantPath)
+	if strings.TrimSpace(result.stdout) != target {
+		t.Errorf("--out path = %q, want %q (explicit path kept as given)", strings.TrimSpace(result.stdout), target)
+	}
+	if !strings.Contains(result.stderr, "Note: hero.jpg contains image/png content; its extension does not match") {
+		t.Errorf("mismatch note missing from stderr:\n%s", result.stderr)
 	}
 	<-requests
 	if result = pretty(dir, "--out", target); result.err != nil {
@@ -394,10 +397,10 @@ func TestVideoConversationalEditingAndOutputFormat(t *testing.T) {
 			b, _ := io.ReadAll(r.Body)
 			posts <- b
 			turn++
-			fmt.Fprintf(w, `{"id":"int-vid-%d","object":"interaction","status":"in_progress","model":"gemini-omni-1.1-flash"}`, turn)
+			fmt.Fprintf(w, `{"id":"int-vid-%d","object":"interaction","status":"in_progress","model":"gemini-omni-1.2-flash"}`, turn)
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/interactions/int-vid-"):
 			id := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-			fmt.Fprintf(w, `{"id":%q,"object":"interaction","status":"completed","model":"gemini-omni-1.1-flash",`+
+			fmt.Fprintf(w, `{"id":%q,"object":"interaction","status":"completed","model":"gemini-omni-1.2-flash",`+
 				`"steps":[{"type":"model_output","content":[{"type":"video","data":"%s","mime_type":"video/mp4"}]}]}`, id, videoB64)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -448,7 +451,7 @@ func TestVideoConversationalEditingAndOutputFormat(t *testing.T) {
 	if err := json.Unmarshal(<-posts, &sent1); err != nil {
 		t.Fatalf("turn 1 request body is not JSON: %v", err)
 	}
-	if sent1.Model != "gemini-omni-1.1-flash" || sent1.Input != "ocean waves at dawn" ||
+	if sent1.Model != "gemini-omni-1.2-flash" || sent1.Input != "ocean waves at dawn" ||
 		sent1.Stream == nil || *sent1.Stream || sent1.Background == nil || !*sent1.Background {
 		t.Errorf("turn 1 top-level fields = %+v", sent1)
 	}
@@ -508,16 +511,17 @@ func TestVideoConversationalEditingAndOutputFormat(t *testing.T) {
 	}
 }
 
-// TestImageArtifactMissingContent pins the failure contract: no image content
-// (or URI-only delivery) is a hard error with an empty stdout and no file.
+// TestImageArtifactMissingContent pins the failure contract: missing image
+// content or an undownloadable URI scheme is a hard error with an empty stdout
+// and no file, whereas a downloadable same-origin URI writes the artifact.
 func TestImageArtifactMissingContent(t *testing.T) {
 	cases := map[string]struct {
 		body string
 		want string
 	}{
-		"in-progress": {`{"id":"int-1","status":"in_progress"}`, `no image content to write (status "in_progress", id "int-1"`},
-		"text-only":   {`{"id":"int-2","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"hi"}]}]}`, "no image content to write"},
-		"uri-only":    {`{"id":"int-3","status":"completed","steps":[{"type":"model_output","content":[{"type":"image","uri":"https://media.example.test/a.png"}]}]}`, "delivered by URI"},
+		"in-progress":            {`{"id":"int-1","status":"in_progress"}`, `no image content to write (status "in_progress", id "int-1"`},
+		"text-only":              {`{"id":"int-2","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"hi"}]}]}`, "no image content to write"},
+		"unsupported-uri-scheme": {`{"id":"int-3","status":"completed","steps":[{"type":"model_output","content":[{"type":"image","uri":"gs://media-bucket/a.png"}]}]}`, "delivered as a gs: URI, which this CLI cannot download"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -543,6 +547,30 @@ func TestImageArtifactMissingContent(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("uri-download", func(t *testing.T) {
+		var server *httptest.Server
+		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/asset.png" {
+				w.Header().Set("Content-Type", "image/png")
+				_, _ = w.Write([]byte("\x89PNG\r\n\x1a\npayload"))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"id":"int-4","status":"completed","steps":[{"type":"model_output","content":[{"type":"image","uri":"%s/asset.png"}]}]}`, server.URL)
+		}))
+		defer server.Close()
+		dir := t.TempDir()
+		args := []string{"--server-url", server.URL, "--api-version", "v1beta", "--no-interactive", "--no-retries", "--color", "never", "--api-key", "test", "image", "a lighthouse"}
+		result := runCLIInDir(t, t.TempDir(), dir, nil, args...)
+		if result.err != nil {
+			t.Fatalf("URI-delivered image failed: %v\nstderr: %s", result.err, result.stderr)
+		}
+		printed := strings.TrimSpace(result.stdout)
+		if data, err := os.ReadFile(printed); err != nil || string(data) != "\x89PNG\r\n\x1a\npayload" {
+			t.Errorf("downloaded file %q = %q (err=%v), want PNG payload", printed, string(data), err)
+		}
+	})
 }
 
 func runCLIWithStdin(t *testing.T, home string, env map[string]string, stdin string, args ...string) commandResult {
@@ -977,7 +1005,7 @@ func TestHelpJourney(t *testing.T) {
 	// exclusive --model / --agent flag sets; examples are runnable flag
 	// invocations, never one JSON-string flag.
 	for _, want := range []string{
-		`--model gemini-3.8-flash`,
+		`--model gemini-4-hydrogen`,
 		`--agent `,
 		`--background`,
 		"Model variant Flags:",
@@ -1012,7 +1040,7 @@ func TestModelsCatalogFromEnum(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("models failed: %v\nstderr: %s", result.err, result.stderr)
 	}
-	if !strings.Contains(result.stdout, "gemini-3.8-flash (default)") {
+	if !strings.Contains(result.stdout, "gemini-4-hydrogen (default)") {
 		t.Errorf("models does not mark the default model:\n%s", result.stdout)
 	}
 	if !strings.Contains(result.stdout, "gemini-pro-latest") {
@@ -1052,8 +1080,8 @@ func TestGenerateIntentCommand(t *testing.T) {
 	if err := json.Unmarshal(request.body, &sent); err != nil {
 		t.Fatalf("request body is not JSON: %v", err)
 	}
-	if sent.Model != "gemini-3.8-flash" {
-		t.Errorf("model = %q, want schema default gemini-3.8-flash", sent.Model)
+	if sent.Model != "gemini-4-hydrogen" {
+		t.Errorf("model = %q, want schema default gemini-4-hydrogen", sent.Model)
 	}
 	if sent.Input != "Explain concurrency in one sentence" {
 		t.Errorf("input = %q, want positional prompt", sent.Input)
@@ -1286,22 +1314,27 @@ func TestJQRawOutputDefaultsTrue(t *testing.T) {
 }
 
 // TestBodySchemaFlag pins the --schema surface: body-bearing commands print
-// the exact, self-contained JSON Schema of their request body.
+// the exact, self-contained JSON Schema of their request body (multi-route
+// commands emit the union; variant-pinned intents emit that variant's schema).
 func TestBodySchemaFlag(t *testing.T) {
-	for _, args := range [][]string{
-		{"agent", "run", "--schema"},
-		{"generate", "--schema"},
-	} {
+	const wantDraft = "https://json-schema.org/draft/2020-12/schema"
+
+	t.Run("agent run union schema", func(t *testing.T) {
+		args := []string{"agent", "run", "--schema"}
 		result := runCLI(t, t.TempDir(), nil, args...)
 		if result.err != nil {
 			t.Fatalf("%v failed: %v\nstderr: %s", args, result.err, result.stderr)
 		}
 		var schema struct {
-			Defs  map[string]json.RawMessage `json:"$defs"`
-			OneOf []json.RawMessage          `json:"oneOf"`
+			Schema string                     `json:"$schema"`
+			Defs   map[string]json.RawMessage `json:"$defs"`
+			OneOf  []json.RawMessage          `json:"oneOf"`
 		}
 		if err := json.Unmarshal([]byte(result.stdout), &schema); err != nil {
 			t.Fatalf("%v output is not JSON: %v", args, err)
+		}
+		if schema.Schema != wantDraft {
+			t.Errorf("%v: $schema = %q, want %q", args, schema.Schema, wantDraft)
 		}
 		if len(schema.OneOf) != 2 {
 			t.Errorf("%v: oneOf variants = %d, want 2", args, len(schema.OneOf))
@@ -1309,7 +1342,103 @@ func TestBodySchemaFlag(t *testing.T) {
 		if len(schema.Defs) == 0 {
 			t.Errorf("%v: schema has no bundled $defs", args)
 		}
+	})
+
+	for _, intent := range []struct {
+		cmd        string
+		previewArg string
+	}{
+		{cmd: "generate", previewArg: "hi"},
+		{cmd: "image", previewArg: "a lighthouse"},
+		{cmd: "video", previewArg: "ocean waves"},
+		{cmd: "music", previewArg: "ambient synth"},
+	} {
+		t.Run(intent.cmd+" pinned variant schema and preview body", func(t *testing.T) {
+			args := []string{intent.cmd, "--schema"}
+			result := runCLI(t, t.TempDir(), nil, args...)
+			if result.err != nil {
+				t.Fatalf("%v failed: %v\nstderr: %s", args, result.err, result.stderr)
+			}
+			var schema struct {
+				Schema string                     `json:"$schema"`
+				Ref    string                     `json:"$ref"`
+				Defs   map[string]json.RawMessage `json:"$defs"`
+				OneOf  []json.RawMessage          `json:"oneOf"`
+			}
+			if err := json.Unmarshal([]byte(result.stdout), &schema); err != nil {
+				t.Fatalf("%v output is not JSON: %v", args, err)
+			}
+			if schema.Schema != wantDraft {
+				t.Errorf("%v: $schema = %q, want %q", args, schema.Schema, wantDraft)
+			}
+			if schema.Ref != "#/$defs/ModelInteraction" {
+				t.Errorf("%v: $ref = %q, want \"#/$defs/ModelInteraction\"", args, schema.Ref)
+			}
+			if len(schema.OneOf) != 0 {
+				t.Errorf("%v: oneOf variants = %d, want 0 (pinned to ModelInteraction)", args, len(schema.OneOf))
+			}
+			modelRaw, ok := schema.Defs["ModelInteraction"]
+			if !ok {
+				t.Fatalf("%v: schema $defs missing ModelInteraction", args)
+			}
+			if _, ok := schema.Defs["AgentInteraction"]; ok {
+				t.Errorf("%v: schema $defs unexpectedly contains AgentInteraction", args)
+			}
+
+			var modelDef struct {
+				Required   []string                   `json:"required"`
+				Properties map[string]map[string]any `json:"properties"`
+			}
+			if err := json.Unmarshal(modelRaw, &modelDef); err != nil {
+				t.Fatalf("unmarshal ModelInteraction def: %v", err)
+			}
+			if len(modelDef.Required) != 1 || modelDef.Required[0] != "model" {
+				t.Errorf("%v: ModelInteraction.required = %v, want [\"model\"]", args, modelDef.Required)
+			}
+			for _, forbidden := range []string{"created", "environment_id", "errors", "id", "status", "steps", "updated", "usage"} {
+				if _, exists := modelDef.Properties[forbidden]; exists {
+					t.Errorf("%v: ModelInteraction.properties unexpectedly contains response-only field %q", args, forbidden)
+				}
+			}
+			for propName, propSchema := range modelDef.Properties {
+				if _, hasRO := propSchema["readOnly"]; hasRO {
+					t.Errorf("%v: ModelInteraction.properties[%q] unexpectedly has readOnly marker", args, propName)
+				}
+				if _, hasWO := propSchema["writeOnly"]; hasWO {
+					t.Errorf("%v: ModelInteraction.properties[%q] unexpectedly has writeOnly marker", args, propName)
+				}
+			}
+
+			dryArgs := append(baseArgs("https://example.invalid"), "--dry-run", intent.cmd, intent.previewArg)
+			dryRes := runCLI(t, t.TempDir(), nil, dryArgs...)
+			if dryRes.err != nil {
+				t.Fatalf("%v --dry-run failed: %v\nstderr: %s", intent.cmd, dryRes.err, dryRes.stderr)
+			}
+			req := parseDryRunRequest(t, dryRes.stdout)
+			body, ok := req["body"].(map[string]any)
+			if !ok {
+				t.Fatalf("%v dry-run request.body = %#v, want object", intent.cmd, req["body"])
+			}
+			for _, reqField := range modelDef.Required {
+				if _, ok := body[reqField]; !ok {
+					t.Errorf("%v preview body missing required field %q: %v", intent.cmd, reqField, body)
+				}
+			}
+			for k := range body {
+				if _, ok := modelDef.Properties[k]; !ok {
+					t.Errorf("%v preview body key %q is not in ModelInteraction.properties", intent.cmd, k)
+				}
+			}
+		})
 	}
+
+	t.Run("generate rejects agent body with exit 2", func(t *testing.T) {
+		args := append(baseArgs("https://example.invalid"), "--dry-run", "generate", "--body", `{"agent":"deep-research","input":"hi"}`)
+		res := runCLI(t, t.TempDir(), nil, args...)
+		if code := exitCode(t, res); code != 2 {
+			t.Errorf("generate with agent body exit code = %d, want 2\nstderr: %s", code, res.stderr)
+		}
+	})
 }
 
 // TestReasonFirstErrorClassification pins spec A8: an HTTP 400 carrying a
@@ -1372,8 +1501,8 @@ func TestDefaultModelInjectedWhenNoSelector(t *testing.T) {
 	if err := json.Unmarshal(<-bodies, &sent); err != nil {
 		t.Fatalf("request body is not JSON: %v", err)
 	}
-	if sent.Model != "gemini-3.8-flash" {
-		t.Errorf("model = %q, want default gemini-3.8-flash injected", sent.Model)
+	if sent.Model != "gemini-4-hydrogen" {
+		t.Errorf("model = %q, want default gemini-4-hydrogen injected", sent.Model)
 	}
 	if sent.Input != "hello" {
 		t.Errorf("input = %q, want hello preserved", sent.Input)
@@ -1477,6 +1606,9 @@ func TestDebugRedactsGeminiAPIKey(t *testing.T) {
 
 // TestAPIVersionDefaultsToV1Beta pins the zero-config path: with no
 // --api-version flag, env var, or config entry, requests go to /v1beta.
+// Managed Agents, credentials, environments, triggers, webhooks, speech,
+// and transcription are only served on v1beta, so a v1 default would
+// break them out of the box.
 func TestAPIVersionDefaultsToV1Beta(t *testing.T) {
 	paths := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

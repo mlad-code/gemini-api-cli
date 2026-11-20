@@ -16,7 +16,7 @@
 
 package interactions
 
-// Model - The model that will complete your prompt.\n\nSee [models](https://ai.google.dev/gemini-api/docs/models) for additional details.
+// Model - The model that will complete your prompt.\n\nSee [models](https://aistudio.google.com/docs/models) for additional details.
 type Model string
 
 const (
@@ -70,10 +70,18 @@ const (
 	ModelGemini38Flash Model = "gemini-3.8-flash"
 	// ModelGemini4Argon Gemini 4 Argon - Our new frontier model, built to solve the hardest problems with depth and precision across real-world software engineering and knowledge work.
 	ModelGemini4Argon Model = "gemini-4-argon"
+	// ModelGemini4Carbon Gemini 4 Carbon - Our most capable reasoning model, built for sustained agentic coding, multimodal knowledge work, scientific discovery, and cybersecurity defense.
+	ModelGemini4Carbon Model = "gemini-4-carbon"
+	// ModelGemini4Hydrogen Gemini 4 Hydrogen - A model with frontier-level intelligence, built for fast, dependable execution across coding, agentic workflows, and multimodal knowledge work.
+	ModelGemini4Hydrogen Model = "gemini-4-hydrogen"
+	// ModelGemini4Neon Gemini 4 Neon - Frontier-level intelligence with fast end-to-end task completion across complex software engineering, analytical, and science workflows.
+	ModelGemini4Neon Model = "gemini-4-neon"
 	// ModelGemini38FlashTts Gemini 3.8 Flash TTS - Flagship TTS model for Voice Design and dual-speaker screenplay control. Prompt custom vocal personas, direct line-by-line delivery, and add vocal bursts.
 	ModelGemini38FlashTts Model = "gemini-3.8-flash-tts"
 	// ModelGemini38FlashLiteTts Gemini 3.8 Flash Lite TTS - High-speed and cost-efficient, ideal for rapid dubbing, media localization, and high-throughput voice agents. Direct replacement for gemini-3.1-flash-tts-preview.
 	ModelGemini38FlashLiteTts Model = "gemini-3.8-flash-lite-tts"
+	// ModelGemini35Transcribe Gemini 3.5 Transcribe - Low-latency speech-to-text model with utterance-based language detection, speaker diarization, word-level timestamps, and custom vocabulary biasing.
+	ModelGemini35Transcribe Model = "gemini-3.5-transcribe"
 	// ModelLyria3ClipPreview Our low-latency, music generation model optimized for high-fidelity audio clips and precise rhythmic control.
 	ModelLyria3ClipPreview Model = "lyria-3-clip-preview"
 	// ModelLyria3ProPreview Our advanced, full-song generative model with deep compositional understanding, optimized for precise structural control and complex transitions across diverse musical styles.
@@ -84,6 +92,8 @@ const (
 	ModelGeminiRoboticsEr2Preview Model = "gemini-robotics-er-2-preview"
 	// ModelLyria35 Our flagship music generation model, optimized for full-length songs with complex structural coherence.
 	ModelLyria35 Model = "lyria-3.5"
+	// ModelGeminiOmni12Flash Gemini Omni 1.2 Flash - Our latest multimodal model for fast, conversational video generation, editing, and cinematic control.
+	ModelGeminiOmni12Flash Model = "gemini-omni-1.2-flash"
 	// ModelGeminiOmni11Flash Our high-performance multimodal model designed for fast, conversational video generation, editing, and cinematic control.
 	ModelGeminiOmni11Flash Model = "gemini-omni-1.1-flash"
 	// ModelGeminiOmniFlashPreview Preview release of our multimodal model for conversational video generation, editing, and cinematic control.
@@ -98,7 +108,7 @@ func (e Model) ToPointer() *Model {
 func (e *Model) IsExact() bool {
 	if e != nil {
 		switch *e {
-		case "gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-image", "gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-image", "gemini-3-pro-image", "nano-banana-pro-preview", "gemini-3.1-flash-image", "gemini-nano-banana-2.1", "gemini-3.1-flash-tts-preview", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon", "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "lyria-3-clip-preview", "lyria-3-pro-preview", "gemini-robotics-er-1.6-preview", "gemini-robotics-er-2-preview", "lyria-3.5", "gemini-omni-1.1-flash", "gemini-omni-flash-preview":
+		case "gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-image", "gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-image", "gemini-3-pro-image", "nano-banana-pro-preview", "gemini-3.1-flash-image", "gemini-nano-banana-2.1", "gemini-3.1-flash-tts-preview", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-neon", "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.5-transcribe", "lyria-3-clip-preview", "lyria-3-pro-preview", "gemini-robotics-er-1.6-preview", "gemini-robotics-er-2-preview", "lyria-3.5", "gemini-omni-1.2-flash", "gemini-omni-1.1-flash", "gemini-omni-flash-preview":
 			return true
 		}
 	}

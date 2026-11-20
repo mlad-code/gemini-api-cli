@@ -32,15 +32,16 @@ func InitIntentAgentRun(parent *cobra.Command) error {
 		Use:     "run [input]",
 		Short:   "Run an interaction with a Gemini model or a managed agent",
 		Long:    "Run one interaction with a Gemini model (--model, the default) or a\nmanaged agent (--agent); the two flag sets are mutually exclusive.\nStreams text as it arrives; --stream=false returns one complete\ninteraction. --body takes the exact request JSON (\"model\"/\"agent\" picks the variant).\n\nArguments:\n  <input>  Prompt or task to send\n\nRequest variants: Agent (--agent), Model (--model; default).\nVariant-specific flags cannot be combined.",
-		Example: "  gemini-api agent run \"Analyze market trends for Q3\" --agent deep-research-preview-04-2026\n  gemini-api agent run \"Write a detailed research report on solar batteries\" --background\n  gemini-api agent run \"Explain the difference between concurrency and parallelism\" --model gemini-3.8-flash",
+		Example: "  gemini-api agent run \"Analyze market trends for Q3\" --agent deep-research-preview-04-2026\n  gemini-api agent run \"Write a detailed research report on solar batteries\" --background\n  gemini-api agent run \"Explain the difference between concurrency and parallelism\" --model gemini-4-hydrogen",
 		Args:    cobra.ArbitraryArgs,
 		RunE:    runIntentAgentRunCmd,
 		Annotations: map[string]string{
 			"speakeasy_operation":            "CreateInteraction",
 			flagutil.AnnotationWholeBodyFlag: "body",
 			"speakeasy_strict_body_keys":     "true",
-			"speakeasy_help_defaults":        "model gemini-3.8-flash · stream true",
+			"speakeasy_help_defaults":        "model gemini-4-hydrogen · stream true",
 			"speakeasy_help_escalate":        "exact request JSON via --body @request.json (schema with --schema)",
+			"speakeasy_outcome":              "{\"statePointer\":\"/status\",\"streamStatePointer\":\"/data/interaction/status\",\"states\":{\"budget_exceeded\":\"success\",\"cancelled\":\"failure\",\"completed\":\"success\",\"failed\":\"failure\",\"in_progress\":\"pending\",\"incomplete\":\"success\",\"queued\":\"pending\",\"requires_action\":\"handoff\",\"requires_continuation\":\"pending\"},\"errorPointer\":\"/errors\",\"errorMessageField\":\"message\"}",
 			"speakeasy_stream_select":        "/data/delta/text",
 			"speakeasy_stream_metadata":      "[{\"label\":\"Interaction ID\",\"pointers\":[\"/data/interaction/id\"]}]",
 		},
@@ -52,7 +53,7 @@ func InitIntentAgentRun(parent *cobra.Command) error {
 	_ = flagutil.AnnotatePromptFlag(cmd, "body", flagutil.PromptFlagSpec{Kind: "json", BodyFlag: true})
 	cmd.Flags().Bool("schema", false, "Print the exact JSON Schema of the request body and exit")
 	_ = flagutil.AnnotatePromptFlag(cmd, "schema", flagutil.PromptFlagSpec{Kind: "bool", DocSurface: true})
-	cmd.Flags().StringP("agent", "", "", "Managed agent to run (see \"gemini-api agent list\") (e.g. deep-research-pro-preview-12-2025, deep-research-preview-04-2026, deep-research-max-preview-04-2026, antigravity-preview-05-2026)")
+	cmd.Flags().StringP("agent", "", "", "Managed agent to run (see \"gemini-api agent list\") (e.g. deep-research-pro-preview-12-2025, deep-research-preview-04-2026, deep-research-max-preview-04-2026, antigravity-preview-05-2026, ...)")
 	flagutil.MarkRequestInput(cmd, "agent")
 	_ = flagutil.AnnotatePromptFlag(cmd, "agent", flagutil.PromptFlagSpec{
 		Required: false,
@@ -72,7 +73,7 @@ func InitIntentAgentRun(parent *cobra.Command) error {
 
 		BodySources: []string{"body"},
 	})
-	cmd.Flags().StringP("model", "m", "", "Model to run (see \"gemini-api models\") (e.g. gemma-4-26b-a4b-it, gemma-4-31b-it, gemini-flash-latest, gemini-flash-lite-latest, ..., default: gemini-3.8-flash)")
+	cmd.Flags().StringP("model", "m", "", "Model to run (see \"gemini-api models\") (e.g. gemma-4-26b-a4b-it, gemma-4-31b-it, gemini-flash-latest, gemini-flash-lite-latest, ..., default: gemini-4-hydrogen)")
 	flagutil.MarkRequestInput(cmd, "model")
 	_ = flagutil.AnnotatePromptFlag(cmd, "model", flagutil.PromptFlagSpec{
 		Required: false,
@@ -132,7 +133,7 @@ var intentAgentRunDispatch = flagutil.DispatchTable{
 			PresetMerge: flagutil.PresetMerge{
 				Command: "agent run", Variant: "AgentInteraction",
 				Preset:  "",
-				Foreign: []string{"created", "id", "model", "status", "updated"},
+				Foreign: []string{"model"},
 				Escape:  "gemini-api agent run",
 			},
 		},
@@ -208,8 +209,8 @@ var intentAgentRunDispatch = flagutil.DispatchTable{
 			UnroutedVariants: []string{},
 		},
 		{
-			BodyKey:          "created",
-			RouteIDs:         []string{"model"},
+			BodyKey:          "continuation_token",
+			RouteIDs:         []string{"agent", "model"},
 			UnroutedVariants: []string{},
 		},
 		{
@@ -218,17 +219,7 @@ var intentAgentRunDispatch = flagutil.DispatchTable{
 			UnroutedVariants: []string{},
 		},
 		{
-			BodyKey:          "environment_id",
-			RouteIDs:         []string{"model"},
-			UnroutedVariants: []string{},
-		},
-		{
 			BodyKey:          "generation_config",
-			RouteIDs:         []string{"model"},
-			UnroutedVariants: []string{},
-		},
-		{
-			BodyKey:          "id",
 			RouteIDs:         []string{"model"},
 			UnroutedVariants: []string{},
 		},
@@ -278,11 +269,6 @@ var intentAgentRunDispatch = flagutil.DispatchTable{
 			UnroutedVariants: []string{},
 		},
 		{
-			BodyKey:          "status",
-			RouteIDs:         []string{"model"},
-			UnroutedVariants: []string{},
-		},
-		{
 			BodyKey:          "store",
 			RouteIDs:         []string{"agent", "model"},
 			UnroutedVariants: []string{},
@@ -300,11 +286,6 @@ var intentAgentRunDispatch = flagutil.DispatchTable{
 		{
 			BodyKey:          "tools",
 			RouteIDs:         []string{"agent", "model"},
-			UnroutedVariants: []string{},
-		},
-		{
-			BodyKey:          "updated",
-			RouteIDs:         []string{"model"},
 			UnroutedVariants: []string{},
 		},
 		{
@@ -335,6 +316,11 @@ func runIntentAgentRunCmd(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(cmd.ErrOrStderr(), hint)
 	}
 	if _, err := flagutil.Select(cmd, args, intentAgentRunDispatch); err != nil {
+		return err
+	}
+	if err := flagutil.ApplyImpliedBody(cmd, "body", []flagutil.ImpliedBody{
+		{Key: "background", Values: "{\"stream\":false}"},
+	}); err != nil {
 		return err
 	}
 	return runRunCmd(cmd, nil)

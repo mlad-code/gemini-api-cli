@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,11 +30,15 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google-gemini/gemini-api-cli/internal/clierrors"
 	"github.com/google-gemini/gemini-api-cli/internal/flagutil"
 	"github.com/google-gemini/gemini-api-cli/internal/output"
+	"github.com/google-gemini/gemini-api-cli/internal/sdk/models/environments"
 	"github.com/google-gemini/gemini-api-cli/internal/sdk/models/interactions"
+	"github.com/google-gemini/gemini-api-cli/internal/sdk/sdkinternal/config"
+	"github.com/google-gemini/gemini-api-cli/internal/sdk/sdkinternal/hooks"
 	"github.com/spf13/cobra"
 )
 
@@ -50,6 +55,9 @@ func TestParseTimestamp(t *testing.T) {
 		"125.5":        125500,
 		"90:15":        5415000,
 		"01:02:03,250": 3723250,
+		"0.100s":       100,
+		"12.345s":      12345,
+		"90s":          90000,
 	}
 	for in, want := range valid {
 		got, err := parseTimestamp(in)
@@ -58,9 +66,238 @@ func TestParseTimestamp(t *testing.T) {
 		}
 	}
 	for _, in := range []string{"", "soon", "1:2:3:4", "-1", "00:-5", "1::2",
-		"00:99", "00:60", "1.5:00", "00:00:61", "0:75:00", "1e3", "Inf", "0x10", "00: 05", "5."} {
+		"00:99", "00:60", "1.5:00", "00:00:61", "0:75:00", "1e3", "Inf", "0x10", "00: 05", "5.", "s", "00:05s", "5ss"} {
 		if got, err := parseTimestamp(in); err == nil {
 			t.Errorf("parseTimestamp(%q) = %d, want an error", in, got)
+		}
+	}
+}
+
+func TestFormatTimestamp(t *testing.T) {
+	for ms, want := range map[int64]string{
+		0:       "00:00",
+		1000:    "00:01",
+		3500:    "00:03.5",
+		61250:   "01:01.25",
+		3723004: "01:02:03.004",
+		-5:      "00:00",
+	} {
+		if got := formatTimestamp(ms); got != want {
+			t.Errorf("formatTimestamp(%d) = %q, want %q", ms, got, want)
+		}
+		if ms >= 0 {
+			if back, err := parseTimestamp(formatTimestamp(ms)); err != nil || back != ms {
+				t.Errorf("parseTimestamp(formatTimestamp(%d)) = %d, %v; want a round trip", ms, back, err)
+			}
+		}
+	}
+}
+
+func TestSpeakerLabels(t *testing.T) {
+	// Speakers are numbered by first appearance whatever the raw scheme: the
+	// live API's zero-based "spk:0", the documented "spk_1", or anything else.
+	labels := speakerLabels{}
+	for _, tc := range []struct{ raw, want string }{
+		{"spk:1", "Speaker 1"}, {"spk:0", "Speaker 2"}, {"spk:1", "Speaker 1"},
+		{"spk_7", "Speaker 3"}, {"", "Speaker"}, {"spk:0", "Speaker 2"},
+	} {
+		if got := labels.label(tc.raw); got != tc.want {
+			t.Errorf("label(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestSegmentsFromWords(t *testing.T) {
+	str := func(s string) *string { return &s }
+	idx := func(i int) *int { return &i }
+	word := func(text, speaker, start, end string, si, ei int) *interactions.WordInfo {
+		w := &interactions.WordInfo{Text: str(text), Speaker: str(speaker), StartOffset: str(start), EndOffset: str(end)}
+		if si >= 0 {
+			w.StartIndex, w.EndIndex = idx(si), idx(ei)
+		}
+		return w
+	}
+	all := segmentOptions{speakers: true, timestamps: true}
+	tests := []struct {
+		name  string
+		block wordBlock
+		opts  segmentOptions
+		want  []transcriptSegment
+	}{
+		{
+			name: "segment text keeps the response punctuation",
+			block: wordBlock{text: "Hello, world. Hi!", words: []*interactions.WordInfo{
+				word("Hello", "spk:0", "0s", "0.5s", 0, 5),
+				word("world", "spk:0", "0.6s", "1s", 7, 12),
+				word("Hi", "spk:1", "1.2s", "1.4s", 14, 16),
+			}},
+			opts: all,
+			want: []transcriptSegment{
+				{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:01", Content: "Hello, world."},
+				{Speaker: "Speaker 2", StartTime: "00:01.2", EndTime: "00:01.4", Content: "Hi!"},
+			},
+		},
+		{
+			name: "languages without spaces are not split apart",
+			block: wordBlock{text: "こんにちは世界。", words: []*interactions.WordInfo{
+				word("こんにちは", "spk:0", "0s", "1s", 0, 15),
+				word("世界", "spk:0", "1s", "2s", 15, 21),
+			}},
+			opts: all,
+			want: []transcriptSegment{{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:02", Content: "こんにちは世界。"}},
+		},
+		{
+			name: "missing indices fall back to joining words",
+			block: wordBlock{text: "Hello world", words: []*interactions.WordInfo{
+				word("Hello", "spk:0", "0s", "0.5s", -1, -1),
+				word("world", "spk:0", "0.6s", "1s", -1, -1),
+			}},
+			opts: all,
+			want: []transcriptSegment{{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:01", Content: "Hello world"}},
+		},
+		{
+			name: "out-of-range indices fall back to joining words",
+			block: wordBlock{text: "Hi", words: []*interactions.WordInfo{
+				word("Hi", "spk:0", "0s", "0.5s", 0, 99),
+			}},
+			opts: all,
+			want: []transcriptSegment{{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:00.5", Content: "Hi"}},
+		},
+		{
+			name: "a long pause splits one speaker's turn",
+			block: wordBlock{text: "one two", words: []*interactions.WordInfo{
+				word("one", "spk:0", "0s", "1s", 0, 3),
+				word("two", "spk:0", "3s", "4s", 4, 7),
+			}},
+			opts: all,
+			want: []transcriptSegment{
+				{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:01", Content: "one"},
+				{Speaker: "Speaker 1", StartTime: "00:03", EndTime: "00:04", Content: "two"},
+			},
+		},
+		{
+			name: "without speakers every sentence is a segment",
+			block: wordBlock{text: "A. B.", words: []*interactions.WordInfo{
+				word("A", "spk:0", "0s", "0.1s", 0, 1),
+				word("B", "spk:0", "0.2s", "0.3s", 3, 4),
+			}},
+			opts: segmentOptions{timestamps: true},
+			want: []transcriptSegment{
+				{StartTime: "00:00", EndTime: "00:00.1", Content: "A."},
+				{StartTime: "00:00.2", EndTime: "00:00.3", Content: "B."},
+			},
+		},
+		{
+			name: "captions are capped in duration",
+			block: wordBlock{text: "a b c", words: []*interactions.WordInfo{
+				word("a", "spk:0", "0s", "1s", 0, 1),
+				word("b", "spk:0", "1s", "6s", 2, 3),
+				word("c", "spk:0", "6s", "8s", 4, 5),
+			}},
+			opts: segmentOptions{speakers: true, timestamps: true, captions: true},
+			want: []transcriptSegment{
+				{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:06", Content: "a b"},
+				{Speaker: "Speaker 1", StartTime: "00:06", EndTime: "00:08", Content: "c"},
+			},
+		},
+		{
+			name: "caption width counts the speaker prefix",
+			block: wordBlock{text: strings.Repeat("a", 40) + " " + strings.Repeat("b", 40), words: []*interactions.WordInfo{
+				word(strings.Repeat("a", 40), "spk:0", "0s", "1s", 0, 40),
+				word(strings.Repeat("b", 40), "spk:0", "1s", "2s", 41, 81),
+			}},
+			opts: segmentOptions{speakers: true, timestamps: true, captions: true},
+			want: []transcriptSegment{
+				{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:01", Content: strings.Repeat("a", 40)},
+				{Speaker: "Speaker 1", StartTime: "00:01", EndTime: "00:02", Content: strings.Repeat("b", 40)},
+			},
+		},
+		{
+			name: "a sentence's last word is not stranded in its own cue",
+			block: wordBlock{text: strings.Repeat("x", 70) + " morning.", words: []*interactions.WordInfo{
+				word(strings.Repeat("x", 70), "spk:0", "0s", "6s", 0, 70),
+				word("morning", "spk:0", "6s", "7.5s", 71, 78),
+			}},
+			opts: segmentOptions{speakers: true, timestamps: true, captions: true},
+			want: []transcriptSegment{
+				{Speaker: "Speaker 1", StartTime: "00:00", EndTime: "00:07.5", Content: strings.Repeat("x", 70) + " morning."},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := segmentsFromWords([]wordBlock{tt.block}, tt.opts)
+			if err != nil {
+				t.Fatalf("segmentsFromWords: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("segmentsFromWords =\n%+v\nwant\n%+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// captionWords builds word_info annotations for text, one word per
+// space-separated token (trailing punctuation stays in the text only, as the
+// live API returns it), stepMs apart with no pauses.
+func captionWords(text, speaker string, stepMs int) []*interactions.WordInfo {
+	var words []*interactions.WordInfo
+	offset := 0
+	for i, token := range strings.Fields(text) {
+		start := strings.Index(text[offset:], token) + offset
+		bare := strings.TrimRight(token, ".,!?")
+		w := &interactions.WordInfo{
+			Text:        &bare,
+			Speaker:     &speaker,
+			StartOffset: stringPtr(fmt.Sprintf("%.3fs", float64(i*stepMs)/1000)),
+			EndOffset:   stringPtr(fmt.Sprintf("%.3fs", float64(i*stepMs+stepMs-50)/1000)),
+			StartIndex:  &start,
+		}
+		end := start + len(bare)
+		w.EndIndex = &end
+		words = append(words, w)
+		offset = start + len(token)
+	}
+	return words
+}
+
+// TestCaptionCuesStayWithinWidth pins the caption width rules: cues split at
+// sentence ends (so a sentence-final word can't drag a cue that already
+// crossed a sentence boundary past the cap), and the sentence-final overflow
+// is bounded.
+func TestCaptionCuesStayWithinWidth(t *testing.T) {
+	opts := segmentOptions{speakers: true, timestamps: true, captions: true}
+	cueWidth := func(seg transcriptSegment) int { return len(seg.Speaker) + len(": ") + len(seg.Content) }
+
+	// From a live clip: this used to render as one 89-byte cue.
+	text := "budget is tight this quarter. We may need to delay the migration by two weeks."
+	got, err := segmentsFromWords([]wordBlock{{text: text, words: captionWords(text, "spk:1", 300)}}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contents []string
+	for _, seg := range got {
+		contents = append(contents, seg.Content)
+		if w := cueWidth(seg); w > captionMaxBytes {
+			t.Errorf("cue %q is %d bytes, want <= %d", seg.Content, w, captionMaxBytes)
+		}
+	}
+	if want := []string{"budget is tight this quarter.", "We may need to delay the migration by two weeks."}; !reflect.DeepEqual(contents, want) {
+		t.Errorf("cues = %q, want %q", contents, want)
+	}
+
+	// A sentence-final word may overflow by at most captionSentenceSlackBytes.
+	long := strings.Repeat("x", 70) + " verylongsentencefinalword."
+	got, err = segmentsFromWords([]wordBlock{{text: long, words: captionWords(long, "spk:0", 300)}}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Content != "verylongsentencefinalword." {
+		t.Errorf("segments = %+v, want the oversized final word in its own cue", got)
+	}
+	for _, seg := range got {
+		if w := cueWidth(seg); w > captionMaxBytes+captionSentenceSlackBytes {
+			t.Errorf("cue %q is %d bytes, want <= %d", seg.Content, w, captionMaxBytes+captionSentenceSlackBytes)
 		}
 	}
 }
@@ -539,6 +776,18 @@ func TestSpeakerTurns(t *testing.T) {
 		// A label with nothing to say is dropped, whether or not space follows.
 		{"Alice: Bob: yo.", []string{"Alice", "Bob"}, []speakerTurn{bob}},
 		{"Alice:Bob: yo.", []string{"Alice", "Bob"}, []speakerTurn{bob}},
+		// Per-turn style annotations in square brackets (parentheticals like "(CEO)" are not styles).
+		{"Alice [whispered urgently]: hi. Bob [excited]: yo.", []string{"Alice", "Bob"}, []speakerTurn{
+			{speaker: "Alice", style: "whispered urgently", text: "hi."},
+			{speaker: "Bob", style: "excited", text: "yo."},
+		}},
+		{"Alice: hi. Bob (CEO): yo.", []string{"Alice", "Bob"}, []speakerTurn{
+			{speaker: "Alice", text: "hi. Bob (CEO): yo."},
+		}},
+		{"- Alice [calm]: hi.\n- Bob: yo.", []string{"Alice", "Bob"}, []speakerTurn{
+			{speaker: "Alice", style: "calm", text: "hi."},
+			bob,
+		}},
 	}
 	for _, tt := range valid {
 		if got, err := speakerTurns(tt.text, tt.speakers); err != nil || !reflect.DeepEqual(got, tt.want) {
@@ -595,7 +844,7 @@ func TestTTSInput(t *testing.T) {
 		{"gemini-2.5-flash-tts", multi, plain},
 		{"gemini-2.5-pro-tts", multi, plain},
 	} {
-		if got, absent, err := ttsInput(tt.model, script, tt.speech); err != nil || absent != nil || !reflect.DeepEqual(got, tt.want) {
+		if got, absent, err := ttsInput(tt.model, script, "", tt.speech); err != nil || absent != nil || !reflect.DeepEqual(got, tt.want) {
 			t.Errorf("ttsInput(%s, multi=%t) = %+v, %q, %v; want %+v", tt.model, tt.speech.SpeakerConfig != nil, got, absent, err, tt.want)
 		}
 	}
@@ -613,8 +862,60 @@ func TestTTSInput(t *testing.T) {
 		{"gemini-3.1-flash-tts-preview", "Alice: hi.", multi, []string{"Bob"}},
 		{"gemini-3.1-flash-tts-preview", "Alice: \u0936\u094d\u0930\u0940\u0930\u093e\u092e \u0930\u093e\u092e\u0940.", speech("--multi-speaker", "Alice=Kore,\u0930\u093e\u092e=Puck"), []string{"\u0930\u093e\u092e"}},
 	} {
-		if _, absent, err := ttsInput(tt.model, tt.text, tt.speech); err != nil || !slices.Equal(absent, tt.want) {
+		if _, absent, err := ttsInput(tt.model, tt.text, "", tt.speech); err != nil || !slices.Equal(absent, tt.want) {
 			t.Errorf("ttsInput(%s, %q) absent = %q, %v; want %q", tt.model, tt.text, absent, err, tt.want)
+		}
+	}
+
+	// Single-speaker with --style trims whitespace and attaches SpeechAnnotation{Style}.
+	gotSingleStyle, _, err := ttsInput(defaultTTSModel, "Hello there.", "  whispered urgently  ", single)
+	wantSingleStyle := []interactions.Content{interactions.CreateContentText(interactions.TextContent{
+		Text: "Hello there.",
+		Annotations: []interactions.Annotation{interactions.CreateAnnotationSpeechMetadata(
+			interactions.SpeechAnnotation{Style: stringPtr("whispered urgently")})},
+	})}
+	if err != nil || !reflect.DeepEqual(gotSingleStyle, wantSingleStyle) {
+		t.Errorf("ttsInput(single) = %+v, %v; want %+v", gotSingleStyle, err, wantSingleStyle)
+	}
+
+	// Multi-speaker with per-turn style and fallback --style.
+	gotMultiStyle, _, err := ttsInput(defaultTTSModel, "Alice [excited]: hi! Bob: yo.", "calm", multi)
+	wantMultiStyle := []interactions.Content{
+		interactions.CreateContentText(interactions.TextContent{
+			Text: "hi!",
+			Annotations: []interactions.Annotation{interactions.CreateAnnotationSpeechMetadata(
+				interactions.SpeechAnnotation{Speaker: stringPtr("Alice"), Style: stringPtr("excited")})},
+		}),
+		interactions.CreateContentText(interactions.TextContent{
+			Text: "yo.",
+			Annotations: []interactions.Annotation{interactions.CreateAnnotationSpeechMetadata(
+				interactions.SpeechAnnotation{Speaker: stringPtr("Bob"), Style: stringPtr("calm")})},
+		}),
+	}
+	if err != nil || !reflect.DeepEqual(gotMultiStyle, wantMultiStyle) {
+		t.Errorf("ttsInput(multi) = %+v, %v; want %+v", gotMultiStyle, err, wantMultiStyle)
+	}
+
+	// Legacy models reject --style.
+	if _, _, err := ttsInput("gemini-2.5-flash-preview-tts", "Hello", "whispered", single); err == nil || !strings.Contains(err.Error(), "--style is not supported") {
+		t.Errorf("ttsInput(legacy) err = %v, want unsupported --style error", err)
+	}
+}
+
+func TestNormalizeVoicePositional(t *testing.T) {
+	for raw, want := range map[string]string{
+		"voice_abc123":          "voice_abc123",
+		"voices/voice_abc123":   "voice_abc123",
+		"  voices/voice_1.2-a ": "voice_1.2-a",
+		"Puck":                  "Puck",
+	} {
+		if got, err := normalizeVoicePositional(raw); err != nil || got != want {
+			t.Errorf("normalizeVoicePositional(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "  ", "voices/", ".", "..", "voices/..", "a/b", "voices/a/b"} {
+		if got, err := normalizeVoicePositional(bad); err == nil {
+			t.Errorf("normalizeVoicePositional(%q) = %q, want error", bad, got)
 		}
 	}
 }
@@ -744,25 +1045,25 @@ func TestNormalizeIdentifier(t *testing.T) {
 			name:      "models get positional prefixed",
 			flagName:  "model",
 			shorthand: "m",
-			desc:      "Model id, e.g. gemini-flash-latest",
+			desc:      "Model id, e.g. gemini-3.8-flash",
 			normalize: normalizeModelPositional,
-			args:      []string{"models/gemini-flash-latest"},
-			wantVal:   "gemini-flash-latest",
+			args:      []string{"models/gemini-3.8-flash"},
+			wantVal:   "gemini-3.8-flash",
 		},
 		{
 			name:      "models get flag bare",
 			flagName:  "model",
 			shorthand: "m",
-			desc:      "Model id, e.g. gemini-flash-latest",
+			desc:      "Model id, e.g. gemini-3.8-flash",
 			normalize: normalizeModelPositional,
-			args:      []string{"--model", "gemini-flash-latest"},
-			wantVal:   "gemini-flash-latest",
+			args:      []string{"--model", "gemini-3.8-flash"},
+			wantVal:   "gemini-3.8-flash",
 		},
 		{
 			name:      "models get invalid flag",
 			flagName:  "model",
 			shorthand: "m",
-			desc:      "Model id, e.g. gemini-flash-latest",
+			desc:      "Model id, e.g. gemini-3.8-flash",
 			normalize: normalizeModelPositional,
 			args:      []string{"--model", "../files/x"},
 			wantErr:   `invalid model id "../files/x"`,
@@ -771,10 +1072,28 @@ func TestNormalizeIdentifier(t *testing.T) {
 			name:      "models get missing id",
 			flagName:  "model",
 			shorthand: "m",
-			desc:      "Model id, e.g. gemini-flash-latest",
+			desc:      "Model id, e.g. gemini-3.8-flash",
 			normalize: normalizeModelPositional,
 			args:      nil,
 			wantErr:   "missing required flag: --model (or pass it as the [model] argument)",
+		},
+		{
+			name:      "voices get positional prefixed",
+			flagName:  "id",
+			shorthand: "i",
+			desc:      "Voice to inspect, as voices/<id> or a bare id",
+			normalize: normalizeVoicePositional,
+			args:      []string{"voices/voice_abc123"},
+			wantVal:   "voice_abc123",
+		},
+		{
+			name:      "voices get invalid flag",
+			flagName:  "id",
+			shorthand: "i",
+			desc:      "Voice to inspect, as voices/<id> or a bare id",
+			normalize: normalizeVoicePositional,
+			args:      []string{"--id", "../secret"},
+			wantErr:   `invalid voice id "../secret"`,
 		},
 	}
 
@@ -1126,8 +1445,11 @@ func TestEnvironmentFilesDownload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// 1. Default output path (./<basename>) in working directory.
+	// 1. Default output path (./<basename>) in working directory resolves to an absolute path.
 	workDir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(workDir); err == nil {
+		workDir = resolved
+	}
 	origWD, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd: %v", err)
@@ -1146,10 +1468,11 @@ func TestEnvironmentFilesDownload(t *testing.T) {
 	if gotQuery != "alt=media" {
 		t.Errorf("query = %q, want alt=media", gotQuery)
 	}
-	if got := stdout.String(); got != "./logo.png\n" {
-		t.Errorf("stdout = %q, want ./logo.png\\n", got)
+	wantDefaultOut := filepath.Join(workDir, "logo.png")
+	if got := stdout.String(); got != wantDefaultOut+"\n" {
+		t.Errorf("stdout = %q, want %q", got, wantDefaultOut+"\n")
 	}
-	diskBytes, err := os.ReadFile(filepath.Join(workDir, "logo.png"))
+	diskBytes, err := os.ReadFile(wantDefaultOut)
 	if err != nil {
 		t.Fatalf("ReadFile default: %v", err)
 	}
@@ -1157,10 +1480,13 @@ func TestEnvironmentFilesDownload(t *testing.T) {
 		t.Errorf("downloaded bytes mismatch: got %v, want %v", diskBytes, binaryContent)
 	}
 
-	// 2. --out <existing-directory> writes <dir>/<basename>.
+	// 2. --out <existing-directory> writes <dir>/<basename> and reports the absolute path.
 	outDir := filepath.Join(t.TempDir(), "downloads")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(outDir); err == nil {
+		outDir = resolved
 	}
 	root2, stdout2, _ := newTestEnvironmentFilesRoot(srv.URL)
 	root2.SetArgs([]string{"environments", "files", "download", "environments/env_abc123", "/src/logo.png", "--out", outDir})
@@ -1174,6 +1500,63 @@ func TestEnvironmentFilesDownload(t *testing.T) {
 	dirDiskBytes, err := os.ReadFile(wantDirOut)
 	if err != nil || !bytes.Equal(dirDiskBytes, binaryContent) {
 		t.Errorf("ReadFile(%q) = %v, %v", wantDirOut, dirDiskBytes, err)
+	}
+
+	// 3. --out ./, relative filename, and absolute filename report matching absolute paths in human and JSON modes.
+	for _, tc := range []struct {
+		name    string
+		outArg  string
+		wantAbs string
+	}{
+		{
+			name:    "dot-slash directory",
+			outArg:  "./",
+			wantAbs: filepath.Join(workDir, "logo.png"),
+		},
+		{
+			name:    "relative filename",
+			outArg:  filepath.Join("rel", "nested-logo.png"),
+			wantAbs: filepath.Join(workDir, "rel", "nested-logo.png"),
+		},
+		{
+			name:    "absolute filename",
+			outArg:  filepath.Join(outDir, "explicit-logo.png"),
+			wantAbs: filepath.Join(outDir, "explicit-logo.png"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			humanRoot, humanOut, _ := newTestEnvironmentFilesRoot(srv.URL)
+			args := []string{"environments", "files", "download", "env_abc123", "src/logo.png", "--out", tc.outArg}
+			output.PreparseRenderingFlags(humanRoot, args)
+			humanRoot.SetArgs(args)
+			if err := humanRoot.Execute(); err != nil {
+				t.Fatalf("human Execute failed: %v", err)
+			}
+			gotHuman := strings.TrimSpace(humanOut.String())
+			if gotHuman != tc.wantAbs {
+				t.Errorf("human stdout = %q, want %q", gotHuman, tc.wantAbs)
+			}
+
+			jsonRoot, jsonOut, _ := newTestEnvironmentFilesRoot(srv.URL)
+			jsonArgs := []string{"environments", "files", "download", "env_abc123", "src/logo.png", "--out", tc.outArg, "-o", "json"}
+			output.PreparseRenderingFlags(jsonRoot, jsonArgs)
+			defer output.PreparseRenderingFlags(jsonRoot, nil)
+			jsonRoot.SetArgs(jsonArgs)
+			if err := jsonRoot.Execute(); err != nil {
+				t.Fatalf("json Execute failed: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(jsonOut.Bytes(), &payload); err != nil {
+				t.Fatalf("unmarshal json output: %v\nraw: %s", err, jsonOut.String())
+			}
+			if gotJSONPath, _ := payload["output_path"].(string); gotJSONPath != tc.wantAbs || gotJSONPath != gotHuman {
+				t.Errorf("json output_path = %q, human = %q, want %q", gotJSONPath, gotHuman, tc.wantAbs)
+			}
+			gotBytes, err := os.ReadFile(tc.wantAbs)
+			if err != nil || !bytes.Equal(gotBytes, binaryContent) {
+				t.Errorf("ReadFile(%q) = %v, %v", tc.wantAbs, gotBytes, err)
+			}
+		})
 	}
 }
 
@@ -1244,6 +1627,71 @@ func TestEnvironmentFilesValidationAndDirectoryErrors(t *testing.T) {
 			name:    "download server 400 directory error rejected with list --recursive hint",
 			args:    []string{"environments", "files", "download", "env_abc123", "dir400"},
 			wantSub: "list --environment env_abc123 --path dir400 --recursive",
+		},
+		{
+			name:    "upload positional and --environment collision",
+			args:    []string{"environments", "files", "upload", "env_demo", "sample.txt", "-e", "env_demo"},
+			wantSub: "pass environment once: as the <environment> argument or via --environment, not both",
+		},
+		{
+			name:    "upload positional and --file collision",
+			args:    []string{"environments", "files", "upload", "env_demo", "sample.txt", "-f", "sample.txt"},
+			wantSub: "pass file once: as the <local-file> argument or via --file, not both",
+		},
+		{
+			name:    "upload single positional and both flags with file collision",
+			args:    []string{"environments", "files", "upload", "sample.txt", "-e", "env_demo", "-f", "sample.txt"},
+			wantSub: "pass file once: as the <local-file> argument or via --file, not both",
+		},
+		{
+			name:    "upload single positional and both flags with environment collision",
+			args:    []string{"environments", "files", "upload", "env_demo", "-e", "env_demo", "-f", "sample.txt"},
+			wantSub: "pass environment once: as the <environment> argument or via --environment, not both",
+		},
+		{
+			name:    "upload single distinct positional and both flags reports environment collision",
+			args:    []string{"environments", "files", "upload", "env_other", "-e", "env_demo", "-f", "sample.txt"},
+			wantSub: "pass environment once: as the <environment> argument or via --environment, not both",
+		},
+		{
+			name:    "upload single positional matching both identical flags reports environment collision",
+			args:    []string{"environments", "files", "upload", "same", "-e", "same", "-f", "same"},
+			wantSub: "pass environment once: as the <environment> argument or via --environment, not both",
+		},
+		{
+			name:    "upload two positionals matching second flag with both flags reports environment collision",
+			args:    []string{"environments", "files", "upload", "sample.txt", "sample.txt", "-e", "env_demo", "-f", "sample.txt"},
+			wantSub: "pass environment once: as the <environment> argument or via --environment, not both",
+		},
+		{
+			name:    "upload genuine excess arguments",
+			args:    []string{"environments", "files", "upload", "env_demo", "sample.txt", "extra.txt"},
+			wantSub: "accepts 2 arguments (<environment> <local-file>), received 3",
+		},
+		{
+			name:    "download positional and --environment collision",
+			args:    []string{"environments", "files", "download", "env_demo", "remote.txt", "-e", "env_demo"},
+			wantSub: "pass environment once: as the <environment> argument or via --environment, not both",
+		},
+		{
+			name:    "download positional and --path collision",
+			args:    []string{"environments", "files", "download", "env_demo", "remote.txt", "-p", "remote.txt"},
+			wantSub: "pass path once: as the <path> argument or via --path, not both",
+		},
+		{
+			name:    "download single positional and both flags with path collision",
+			args:    []string{"environments", "files", "download", "remote.txt", "-e", "env_demo", "-p", "remote.txt"},
+			wantSub: "pass path once: as the <path> argument or via --path, not both",
+		},
+		{
+			name:    "download single positional and both flags with environment collision",
+			args:    []string{"environments", "files", "download", "env_demo", "-e", "env_demo", "-p", "remote.txt"},
+			wantSub: "pass environment once: as the <environment> argument or via --environment, not both",
+		},
+		{
+			name:    "download genuine excess arguments",
+			args:    []string{"environments", "files", "download", "env_demo", "remote.txt", "extra.txt"},
+			wantSub: "accepts 2 arguments (<environment> <path>), received 3",
 		},
 	}
 
@@ -1347,6 +1795,23 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 		return root
 	}
 
+	unwrapSingleUserInputContent := func(t *testing.T, parsed map[string]any) []any {
+		t.Helper()
+		steps, ok := parsed["input"].([]any)
+		if !ok || len(steps) != 1 {
+			t.Fatalf("input = %#v, want a single-element user_input step array", parsed["input"])
+		}
+		step, ok := steps[0].(map[string]any)
+		if !ok || step["type"] != "user_input" {
+			t.Fatalf("input[0] = %#v, want user_input step", steps[0])
+		}
+		content, ok := step["content"].([]any)
+		if !ok {
+			t.Fatalf("input[0].content = %#v, want content array", step["content"])
+		}
+		return content
+	}
+
 	t.Run("image -i local file with prompt encodes inline base64 and appends text block", func(t *testing.T) {
 		var gotBody string
 		var gotArgs []string
@@ -1362,9 +1827,9 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 		if err := json.Unmarshal([]byte(gotBody), &parsed); err != nil {
 			t.Fatalf("Unmarshal body %q: %v", gotBody, err)
 		}
-		inputs, _ := parsed["input"].([]any)
+		inputs := unwrapSingleUserInputContent(t, parsed)
 		if len(inputs) != 2 {
-			t.Fatalf("input len = %d, want 2: %v", len(inputs), parsed["input"])
+			t.Fatalf("content len = %d, want 2: %v", len(inputs), inputs)
 		}
 		imgPart, _ := inputs[0].(map[string]any)
 		if imgPart["type"] != "image" || imgPart["mime_type"] != "image/png" || imgPart["data"] != wantB64 {
@@ -1425,7 +1890,40 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 		}
 	})
 
-	t.Run("generate -b with short files/<id> under --dry-run expands URI without FilesGet", func(t *testing.T) {
+	t.Run("generate -b with short files/<id> missing mime_type under --dry-run previews FilesGet and sets document placeholder without live call", func(t *testing.T) {
+		filesGetCalls = 0
+		var gotBody string
+		var gotArgs []string
+		root := newTestTree(&gotBody, &gotArgs)
+		root.SetArgs([]string{"generate", "--dry-run", "-b", `{"input":[{"uri":"files/abc123"},{"type":"text","text":"Hi"}]}`})
+		if err := root.Execute(); err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+		if filesGetCalls != 0 {
+			t.Errorf("filesGetCalls = %d, want 0 under --dry-run", filesGetCalls)
+		}
+		stderr := root.ErrOrStderr().(*bytes.Buffer).String()
+		if !strings.Contains(stderr, "GET "+srv.URL+"/v1beta/files/abc123") {
+			t.Errorf("stderr missing dry-run GET preview; got:\n%s", stderr)
+		}
+		if !strings.Contains(stderr, `[DRY-RUN] uri "files/abc123": the file's URI and MIME type come from the files.get response; the previewed block is a placeholder.`) {
+			t.Errorf("stderr missing placeholder note; got:\n%s", stderr)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(gotBody), &parsed); err != nil {
+			t.Fatalf("Unmarshal body %q: %v", gotBody, err)
+		}
+		inputs, _ := parsed["input"].([]any)
+		docPart, _ := inputs[0].(map[string]any)
+		if docPart["type"] != "document" || docPart["uri"] != "https://generativelanguage.googleapis.com/v1beta/files/abc123" {
+			t.Errorf("docPart = %+v, want placeholder type=document and full v1beta files URI", docPart)
+		}
+		if _, hasMime := docPart["mime_type"]; hasMime {
+			t.Errorf("docPart unexpectedly has mime_type in placeholder: %+v", docPart)
+		}
+	})
+
+	t.Run("generate -b with short files/<id> and supplied type missing mime_type under --dry-run previews FilesGet and preserves caller type", func(t *testing.T) {
 		filesGetCalls = 0
 		var gotBody string
 		var gotArgs []string
@@ -1437,14 +1935,51 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 		if filesGetCalls != 0 {
 			t.Errorf("filesGetCalls = %d, want 0 under --dry-run", filesGetCalls)
 		}
+		stderr := root.ErrOrStderr().(*bytes.Buffer).String()
+		if !strings.Contains(stderr, "GET "+srv.URL+"/v1beta/files/abc123") {
+			t.Errorf("stderr missing dry-run GET preview; got:\n%s", stderr)
+		}
+		if !strings.Contains(stderr, `[DRY-RUN] uri "files/abc123": the file's URI and MIME type come from the files.get response; the previewed block is a placeholder.`) {
+			t.Errorf("stderr missing placeholder note; got:\n%s", stderr)
+		}
 		var parsed map[string]any
 		if err := json.Unmarshal([]byte(gotBody), &parsed); err != nil {
 			t.Fatalf("Unmarshal body %q: %v", gotBody, err)
 		}
 		inputs, _ := parsed["input"].([]any)
 		imgPart, _ := inputs[0].(map[string]any)
-		if imgPart["uri"] != "https://generativelanguage.googleapis.com/v1beta/files/abc123" {
-			t.Errorf("uri = %v, want full v1beta files URI", imgPart["uri"])
+		if imgPart["type"] != "image" || imgPart["uri"] != "https://generativelanguage.googleapis.com/v1beta/files/abc123" {
+			t.Errorf("imgPart = %+v, want caller type=image preserved and full v1beta files URI", imgPart)
+		}
+		if _, hasMime := imgPart["mime_type"]; hasMime {
+			t.Errorf("imgPart unexpectedly has mime_type in dry-run preview: %+v", imgPart)
+		}
+	})
+
+	t.Run("generate -b with short files/<id> and supplied mime_type under --dry-run expands URI without FilesGet preview", func(t *testing.T) {
+		filesGetCalls = 0
+		var gotBody string
+		var gotArgs []string
+		root := newTestTree(&gotBody, &gotArgs)
+		root.SetArgs([]string{"generate", "--dry-run", "-b", `{"input":[{"uri":"files/abc123","mime_type":"image/png"}]}`})
+		if err := root.Execute(); err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+		if filesGetCalls != 0 {
+			t.Errorf("filesGetCalls = %d, want 0 under --dry-run", filesGetCalls)
+		}
+		stderr := root.ErrOrStderr().(*bytes.Buffer).String()
+		if strings.Contains(stderr, "/v1beta/files/abc123") {
+			t.Errorf("stderr unexpectedly previewed files.get when mime_type was supplied:\n%s", stderr)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(gotBody), &parsed); err != nil {
+			t.Fatalf("Unmarshal body %q: %v", gotBody, err)
+		}
+		inputs, _ := parsed["input"].([]any)
+		imgPart, _ := inputs[0].(map[string]any)
+		if imgPart["type"] != "image" || imgPart["mime_type"] != "image/png" || imgPart["uri"] != "https://generativelanguage.googleapis.com/v1beta/files/abc123" {
+			t.Errorf("imgPart = %+v, want type=image, mime_type=image/png, and full v1beta files URI", imgPart)
 		}
 	})
 
@@ -1467,9 +2002,9 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 		if err := json.Unmarshal([]byte(gotBody), &parsed); err != nil {
 			t.Fatalf("Unmarshal body %q: %v", gotBody, err)
 		}
-		inputs, _ := parsed["input"].([]any)
+		inputs := unwrapSingleUserInputContent(t, parsed)
 		if len(inputs) != 2 {
-			t.Fatalf("input len = %d, want 2: %v", len(inputs), parsed["input"])
+			t.Fatalf("content len = %d, want 2: %v", len(inputs), inputs)
 		}
 		imgPart, _ := inputs[0].(map[string]any)
 		if imgPart["uri"] != "https://generativelanguage.googleapis.com/v1beta/files/abc123" || imgPart["mime_type"] != "image/jpeg" {
@@ -1524,6 +2059,8 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 		for _, bodyJSON := range []string{
 			`{"input":[{"type":"text","text":"existing array item"}]}`,
 			`{"input":{"type":"text","text":"existing map item"}}`,
+			`{"input":[{"type":"user_input","content":[{"type":"text","text":"existing step item"}]}]}`,
+			`{"input":{"type":"user_input","content":[{"type":"text","text":"existing step map item"}]}}`,
 		} {
 			var gotBody string
 			var gotArgs []string
@@ -1536,9 +2073,9 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 			if err := json.Unmarshal([]byte(gotBody), &parsed); err != nil {
 				t.Fatalf("Unmarshal body %q: %v", gotBody, err)
 			}
-			inputs, _ := parsed["input"].([]any)
+			inputs := unwrapSingleUserInputContent(t, parsed)
 			if len(inputs) != 2 {
-				t.Errorf("input len for %s = %d, want 2: %v", bodyJSON, len(inputs), parsed["input"])
+				t.Errorf("content len for %s = %d, want 2: %v", bodyJSON, len(inputs), inputs)
 			}
 		}
 	})
@@ -1591,6 +2128,54 @@ func TestAttachInteractionInputsAndNormalizeFilesURIs(t *testing.T) {
 		err := output.CLIError(root, rawErr)
 		if got := clierrors.ExitCode(err); got != clierrors.ExitUsage {
 			t.Errorf("ExitCode = %d, want %d (ExitUsage)", got, clierrors.ExitUsage)
+		}
+	})
+
+	t.Run("body and stdin preserve exact integer digits with and without -i and reject trailing JSON", func(t *testing.T) {
+		const rawJSON = `{"input":[{"type":"function_result","call_id":"c1","name":"fn","result":{"id":1234567890123456789,"cursor":9007199254740993,"ratio":0.25,"code":"1234567890123456789"}}],"response_format":{"type":"text","mime_type":"application/json","schema":{"type":"object","properties":{"n":{"type":"integer","maximum":9223372036854775807}}}}}`
+
+		for _, withInput := range []bool{false, true} {
+			var gotBody string
+			var gotArgs []string
+			root := newTestTree(&gotBody, &gotArgs)
+			args := []string{"generate", "--body", rawJSON}
+			if withInput {
+				args = append(args, "-i", localImg)
+			}
+			root.SetArgs(args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("Execute(withInput=%v) failed: %v", withInput, err)
+			}
+			for _, want := range []string{
+				`"id":1234567890123456789`,
+				`"cursor":9007199254740993`,
+				`"maximum":9223372036854775807`,
+				`"ratio":0.25`,
+				`"code":"1234567890123456789"`,
+			} {
+				if !strings.Contains(gotBody, want) {
+					t.Errorf("withInput=%v: body missing %s; got %s", withInput, want, gotBody)
+				}
+			}
+		}
+
+		for _, badStdin := range []string{
+			`{"input":"hi"}{"extra":1}`,
+			`{"input":"hi"} trailing`,
+		} {
+			var gotBody string
+			var gotArgs []string
+			root := newTestTree(&gotBody, &gotArgs)
+			root.SetIn(strings.NewReader(badStdin))
+			root.SetArgs([]string{"generate"})
+			rawErr := root.Execute()
+			if rawErr == nil {
+				t.Fatalf("expected error for trailing stdin JSON %q", badStdin)
+			}
+			err := output.CLIError(root, rawErr)
+			if got := clierrors.ExitCode(err); got != clierrors.ExitUsage {
+				t.Errorf("ExitCode(%q) = %d, want %d (ExitUsage)", badStdin, got, clierrors.ExitUsage)
+			}
 		}
 	})
 }
@@ -1664,5 +2249,848 @@ func TestRawTransportRecordsCredentialsMissing(t *testing.T) {
 				t.Errorf("accessToken = %q, want %q", tr.accessToken, tc.wantToken)
 			}
 		})
+	}
+}
+
+func TestRawTransportHeadersTimeoutAndServerURL(t *testing.T) {
+	t.Run("repeated headers preserve order, Accept replaces default, Authorization removes API key", func(t *testing.T) {
+		root, _, _ := newTestEnvironmentFilesRoot("https://example.com")
+		args := []string{
+			"--api-key", "secret-key",
+			"-H", "X-A: 1",
+			"-H", "x-a: 2",
+			"-H", "  X-Trim:  trimmed\r\n",
+			"-H", "Accept: application/vnd.custom+json",
+			"-H", "Authorization: Bearer override-token",
+			"--timeout", "30s",
+		}
+		if err := root.PersistentFlags().Parse(args); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		tr, err := newRawTransport(root)
+		if err != nil {
+			t.Fatalf("newRawTransport: %v", err)
+		}
+		if tr.timeout != 30*time.Second {
+			t.Errorf("timeout = %v, want 30s", tr.timeout)
+		}
+		req, err := tr.newRequest(t.Context(), http.MethodPost, tr.apiURL("v1/files"), nil)
+		if err != nil {
+			t.Fatalf("newRequest: %v", err)
+		}
+		if got := req.Header.Values("X-A"); !slices.Equal(got, []string{"1", "2"}) {
+			t.Errorf("X-A values = %v, want [1 2]", got)
+		}
+		if got := req.Header.Values("X-Trim"); !slices.Equal(got, []string{"trimmed"}) {
+			t.Errorf("X-Trim values = %v, want [trimmed]", got)
+		}
+		if got := req.Header.Values("Accept"); !slices.Equal(got, []string{"application/vnd.custom+json"}) {
+			t.Errorf("Accept values = %v, want [application/vnd.custom+json]", got)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer override-token" {
+			t.Errorf("Authorization = %q, want Bearer override-token", got)
+		}
+		if got := req.Header.Get("x-goog-api-key"); got != "" {
+			t.Errorf("x-goog-api-key = %q, want empty when Authorization is set", got)
+		}
+	})
+
+	t.Run("invalid headers fail with exit 2 without echoing secret values", func(t *testing.T) {
+		const secret = "top-secret-cred-98765"
+		badHeaders := []string{
+			"Authorization Bearer " + secret,
+			"bad name: " + secret,
+			": " + secret,
+			"Authorization: Bearer " + secret + "\r\nX-Injected: 1",
+			"X-Token: " + secret + "\nX-Injected: 1",
+			"X-Token: " + secret + "\x00extra",
+			flagutil.RepeatedHeadersMarker + ": X-A",
+		}
+		for _, h := range badHeaders {
+			root, _, _ := newTestEnvironmentFilesRoot("https://example.com")
+			if err := root.PersistentFlags().Parse([]string{"-H", h}); err != nil {
+				t.Fatalf("Parse(%q): %v", h, err)
+			}
+			_, rawErr := newRawTransport(root)
+			if rawErr == nil {
+				t.Fatalf("expected error for invalid header %q", h)
+			}
+			if strings.Contains(rawErr.Error(), secret) {
+				t.Errorf("error for %q leaked secret: %v", h, rawErr)
+			}
+			err := output.CLIError(root, rawErr)
+			if got := clierrors.ExitCode(err); got != clierrors.ExitUsage {
+				t.Errorf("ExitCode(%q) = %d, want %d", h, got, clierrors.ExitUsage)
+			}
+		}
+	})
+
+	t.Run("invalid timeouts and server URLs fail with exit 2", func(t *testing.T) {
+		for _, badTimeout := range []string{"0s", "-1s", "abc"} {
+			root, _, _ := newTestEnvironmentFilesRoot("https://example.com")
+			if err := root.PersistentFlags().Parse([]string{"--timeout", badTimeout}); err != nil {
+				t.Fatalf("Parse(--timeout %q): %v", badTimeout, err)
+			}
+			_, rawErr := newRawTransport(root)
+			if rawErr == nil {
+				t.Fatalf("expected error for --timeout %q", badTimeout)
+			}
+			err := output.CLIError(root, rawErr)
+			if got := clierrors.ExitCode(err); got != clierrors.ExitUsage {
+				t.Errorf("ExitCode(--timeout %q) = %d, want %d", badTimeout, got, clierrors.ExitUsage)
+			}
+		}
+
+		for _, badURL := range []string{"ftp://x", "https://"} {
+			root, _, _ := newTestEnvironmentFilesRoot(badURL)
+			if err := root.PersistentFlags().Parse([]string{"--server-url", badURL}); err != nil {
+				t.Fatalf("Parse(--server-url %q): %v", badURL, err)
+			}
+			uploadCmd := findChild(findChild(findChild(root, "environments"), "files"), "upload")
+			_, rawErr := newRawTransport(uploadCmd)
+			if rawErr == nil {
+				t.Fatalf("expected error for --server-url %q", badURL)
+			}
+			err := output.CLIError(root, rawErr)
+			if got := clierrors.ExitCode(err); got != clierrors.ExitUsage {
+				t.Errorf("ExitCode(--server-url %q) = %d, want %d", badURL, got, clierrors.ExitUsage)
+			}
+		}
+	})
+}
+
+func TestNormalizeModelFlag(t *testing.T) {
+	newModelCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "generate"}
+		cmd.Flags().StringP("model", "m", "gemini-flash-latest", "")
+		return cmd
+	}
+
+	t.Run("omitted flag leaves default untouched", func(t *testing.T) {
+		cmd := newModelCmd()
+		if err := cmd.Flags().Parse(nil); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if err := normalizeModelFlag(cmd); err != nil {
+			t.Fatalf("normalizeModelFlag: %v", err)
+		}
+		if flagutil.FlagChanged(cmd, "model") {
+			t.Error("expected model flag to remain unchanged when omitted")
+		}
+	})
+
+	t.Run("explicit empty or whitespace values fail with CLI_VALIDATION exit 2", func(t *testing.T) {
+		for _, blank := range []string{"", " ", "   ", "\t\n", "models/", "models/   "} {
+			cmd := newModelCmd()
+			if err := cmd.Flags().Parse([]string{"-m", blank}); err != nil {
+				t.Fatalf("Parse(-m %q): %v", blank, err)
+			}
+			err := normalizeModelFlag(cmd)
+			if err == nil {
+				t.Fatalf("normalizeModelFlag(-m %q) succeeded; want validation error", blank)
+			}
+			c := output.Classify(cmd, err)
+			if c.Reason != "CLI_VALIDATION" {
+				t.Errorf("Classify(-m %q).Reason = %q, want CLI_VALIDATION", blank, c.Reason)
+			}
+			if got := output.ExitCodeFor(c); got != clierrors.ExitUsage {
+				t.Errorf("ExitCodeFor(-m %q) = %d, want %d", blank, got, clierrors.ExitUsage)
+			}
+		}
+	})
+
+	t.Run("valid bare and prefixed models normalize in place", func(t *testing.T) {
+		for _, tc := range []struct {
+			in   string
+			want string
+		}{
+			{"gemini-2.5-pro", "gemini-2.5-pro"},
+			{"models/gemini-2.5-pro", "gemini-2.5-pro"},
+			{"  models/gemini-flash-latest  ", "gemini-flash-latest"},
+		} {
+			cmd := newModelCmd()
+			if err := cmd.Flags().Parse([]string{"-m", tc.in}); err != nil {
+				t.Fatalf("Parse(-m %q): %v", tc.in, err)
+			}
+			if err := normalizeModelFlag(cmd); err != nil {
+				t.Fatalf("normalizeModelFlag(-m %q): %v", tc.in, err)
+			}
+			got, _ := cmd.Flags().GetString("model")
+			if got != tc.want {
+				t.Errorf("model after normalize(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		}
+	})
+}
+
+func TestMediaSourceBlockDryRun(t *testing.T) {
+	dir := t.TempDir()
+	sdkHooks := hooks.New()
+	cfg := config.SDKConfiguration{}
+	cfg.Globals.APIVersion = stringPtr("v1")
+	hookCtx := hooks.BeforeRequestContext{
+		HookContext: hooks.HookContext{
+			SDKConfiguration: cfg,
+			OperationID:      "CreateInteraction",
+		},
+	}
+
+	newDryRunCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "test"}
+		cmd.Flags().Bool("dry-run", true, "")
+		cmd.SetContext(t.Context())
+		return cmd
+	}
+
+	t.Run("text file dry-run records exact escaped JSON delta and inlineBytes", func(t *testing.T) {
+		txtPath := filepath.Join(dir, "sample.txt")
+		raw := []byte("hello <&> world")
+		if err := os.WriteFile(txtPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		root := newDryRunCmd()
+
+		src := &mediaSource{path: txtPath, mimeType: "text/plain", ref: "--input sample.txt"}
+		content, err := src.block(root)
+		if err != nil {
+			t.Fatalf("block: %v", err)
+		}
+		if src.inlineBytes != int64(len(raw)) {
+			t.Errorf("inlineBytes = %d, want %d", src.inlineBytes, len(raw))
+		}
+		if content.TextContent == nil || content.TextContent.Text != fmt.Sprintf("<bytes:%d>", len(raw)) {
+			t.Fatalf("content = %+v, want <bytes:%d>", content, len(raw))
+		}
+
+		previewJSON, _ := json.Marshal(content.TextContent.Text)
+		realJSON, _ := json.Marshal(string(raw))
+		wantDelta := int64(len(realJSON) - len(previewJSON))
+
+		// Verify exact boundary: previewBodyLen + wantDelta == maxInlineRequestBytes passes; +1 fails.
+		previewBody := bytes.Repeat([]byte{'a'}, int(maxInlineRequestBytes-wantDelta))
+		req, err := http.NewRequestWithContext(root.Context(), http.MethodPost, "https://example.com/v1/interactions", bytes.NewReader(previewBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sdkHooks.BeforeRequest(hookCtx, req); err != nil {
+			t.Fatalf("expected exact limit to pass, got: %v", err)
+		}
+
+		// Re-run block to record delta again and test 1 byte over limit.
+		if _, err := src.block(root); err != nil {
+			t.Fatalf("block: %v", err)
+		}
+		overBody := bytes.Repeat([]byte{'a'}, int(maxInlineRequestBytes-wantDelta+1))
+		reqOver, err := http.NewRequestWithContext(root.Context(), http.MethodPost, "https://example.com/v1/interactions", bytes.NewReader(overBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sdkHooks.BeforeRequest(hookCtx, reqOver); err == nil {
+			t.Fatal("expected 1 byte over limit to fail")
+		}
+	})
+
+	t.Run("binary file dry-run records exact base64 JSON delta and inlineBytes", func(t *testing.T) {
+		binPath := filepath.Join(dir, "sample.png")
+		raw := bytes.Repeat([]byte{0x89, 0x50, 0x4e}, 100)
+		if err := os.WriteFile(binPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		root := newDryRunCmd()
+
+		src := &mediaSource{path: binPath, mimeType: "image/png", ref: "--input sample.png"}
+		content, err := src.block(root)
+		if err != nil {
+			t.Fatalf("block: %v", err)
+		}
+		wantInline := int64(base64.StdEncoding.EncodedLen(len(raw)))
+		if src.inlineBytes != wantInline {
+			t.Errorf("inlineBytes = %d, want %d", src.inlineBytes, wantInline)
+		}
+		if content.ImageContent == nil || content.ImageContent.Data == nil || *content.ImageContent.Data != fmt.Sprintf("<bytes:%d>", len(raw)) {
+			t.Fatalf("content = %+v, want <bytes:%d>", content, len(raw))
+		}
+
+		previewJSON, _ := json.Marshal(*content.ImageContent.Data)
+		wantDelta := (2 + wantInline) - int64(len(previewJSON))
+
+		previewBody := bytes.Repeat([]byte{'a'}, int(maxInlineRequestBytes-wantDelta))
+		req, err := http.NewRequestWithContext(root.Context(), http.MethodPost, "https://example.com/v1/interactions", bytes.NewReader(previewBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sdkHooks.BeforeRequest(hookCtx, req); err != nil {
+			t.Fatalf("expected exact limit to pass, got: %v", err)
+		}
+
+		if _, err := src.block(root); err != nil {
+			t.Fatalf("block: %v", err)
+		}
+		overBody := bytes.Repeat([]byte{'a'}, int(maxInlineRequestBytes-wantDelta+1))
+		reqOver, err := http.NewRequestWithContext(root.Context(), http.MethodPost, "https://example.com/v1/interactions", bytes.NewReader(overBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sdkHooks.BeforeRequest(hookCtx, reqOver); err == nil {
+			t.Fatal("expected 1 byte over limit to fail")
+		}
+	})
+
+	t.Run("oversized file under dry-run is rejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			mime string
+			size int64
+		}{
+			{"big.png", "image/png", 16 << 20},
+			{"big.txt", "text/plain", maxInlineBytes + 1},
+		} {
+			bigPath := filepath.Join(dir, tc.name)
+			f, err := os.Create(bigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Truncate(tc.size); err != nil {
+				_ = f.Close()
+				t.Fatal(err)
+			}
+			_ = f.Close()
+
+			root := newDryRunCmd()
+			src := &mediaSource{path: bigPath, mimeType: tc.mime, ref: "--input " + tc.name}
+			_, err = src.block(root)
+			if err == nil || !strings.Contains(err.Error(), "file grew past the inline limit") {
+				t.Fatalf("%s: expected inline limit error, got: %v", tc.name, err)
+			}
+		}
+	})
+}
+
+func TestNewModelInteractionUsesUserInputStep(t *testing.T) {
+	video := interactions.CreateContentVideo(interactions.VideoContent{URI: stringPtr("https://www.youtube.com/watch?v=rRJ7Jhun12I")})
+	text := textContentBlock("Describe the video.")
+	req := newModelInteraction("gemini-3.8-flash", video, text)
+	if req.Input == nil || req.Input.Type != interactions.InteractionsInputTypeArrayOfStep {
+		t.Fatalf("Input.Type = %v, want %v", req.Input, interactions.InteractionsInputTypeArrayOfStep)
+	}
+	if len(req.Input.ArrayOfStep) != 1 || req.Input.ArrayOfStep[0].UserInputStep == nil {
+		t.Fatalf("ArrayOfStep = %+v, want a single UserInputStep", req.Input.ArrayOfStep)
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	wantInput := []any{
+		map[string]any{
+			"type": "user_input",
+			"content": []any{
+				map[string]any{"type": "video", "uri": "https://www.youtube.com/watch?v=rRJ7Jhun12I"},
+				map[string]any{"type": "text", "text": "Describe the video."},
+			},
+		},
+	}
+	if !reflect.DeepEqual(decoded["input"], wantInput) {
+		t.Errorf("serialized input = %#v, want %#v", decoded["input"], wantInput)
+	}
+}
+
+func TestMergeMediaBlocksIntoInput(t *testing.T) {
+	imgBlock := map[string]any{"type": "image", "mime_type": "image/png", "data": "b64"}
+	txtBlock := map[string]any{"type": "text", "text": "hello"}
+	media := []any{imgBlock}
+
+	successCases := []struct {
+		name     string
+		existing any
+		want     any
+	}{
+		{
+			name:     "nil existing",
+			existing: nil,
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock}},
+			},
+		},
+		{
+			name:     "empty slice existing",
+			existing: []any{},
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock}},
+			},
+		},
+		{
+			name:     "string existing",
+			existing: "hello",
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name:     "empty string existing",
+			existing: "",
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock}},
+			},
+		},
+		{
+			name:     "single content map existing",
+			existing: txtBlock,
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name:     "content array existing",
+			existing: []any{txtBlock},
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name:     "single user_input step map with content slice",
+			existing: map[string]any{"type": "user_input", "content": []any{txtBlock}},
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name:     "single user_input step map with string content",
+			existing: map[string]any{"type": "user_input", "content": "hello"},
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name:     "single user_input step map with single content map",
+			existing: map[string]any{"type": "user_input", "content": txtBlock},
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name:     "single user_input step map with nil content",
+			existing: map[string]any{"type": "user_input"},
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{imgBlock}},
+			},
+		},
+		{
+			name: "step array with prior model_output and trailing user_input preserves ordering and roles",
+			existing: []any{
+				map[string]any{"type": "model_output", "content": []any{map[string]any{"type": "text", "text": "prior"}}},
+				map[string]any{"type": "user_input", "content": []any{txtBlock}},
+			},
+			want: []any{
+				map[string]any{"type": "model_output", "content": []any{map[string]any{"type": "text", "text": "prior"}}},
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name: "multi-turn history with google_maps, processing, retrieval, and future step types merges into final user_input",
+			existing: []any{
+				map[string]any{"type": "user_input", "content": []any{map[string]any{"type": "text", "text": "turn 1"}}},
+				map[string]any{"type": "model_output", "content": []any{map[string]any{"type": "text", "text": "reply 1"}}},
+				map[string]any{"type": "google_maps_call", "id": "m1"},
+				map[string]any{"type": "google_maps_result", "call_id": "m1"},
+				map[string]any{"type": "processing_call", "id": "p1"},
+				map[string]any{"type": "processing_result", "call_id": "p1"},
+				map[string]any{"type": "retrieval_call", "id": "r1"},
+				map[string]any{"type": "retrieval_result", "call_id": "r1"},
+				map[string]any{"type": "future_server_step", "id": "f1"},
+				map[string]any{"type": "model_output", "content": []any{map[string]any{"type": "text", "text": "reply 2"}}},
+				map[string]any{"type": "user_input", "content": []any{txtBlock}},
+			},
+			want: []any{
+				map[string]any{"type": "user_input", "content": []any{map[string]any{"type": "text", "text": "turn 1"}}},
+				map[string]any{"type": "model_output", "content": []any{map[string]any{"type": "text", "text": "reply 1"}}},
+				map[string]any{"type": "google_maps_call", "id": "m1"},
+				map[string]any{"type": "google_maps_result", "call_id": "m1"},
+				map[string]any{"type": "processing_call", "id": "p1"},
+				map[string]any{"type": "processing_result", "call_id": "p1"},
+				map[string]any{"type": "retrieval_call", "id": "r1"},
+				map[string]any{"type": "retrieval_result", "call_id": "r1"},
+				map[string]any{"type": "future_server_step", "id": "f1"},
+				map[string]any{"type": "model_output", "content": []any{map[string]any{"type": "text", "text": "reply 2"}}},
+				map[string]any{"type": "user_input", "content": []any{imgBlock, txtBlock}},
+			},
+		},
+		{
+			name: "function_result step array appends user_input step after function_result",
+			existing: []any{
+				map[string]any{"type": "function_result", "call_id": "c1", "name": "fn", "result": map[string]any{"ok": true}},
+			},
+			want: []any{
+				map[string]any{"type": "function_result", "call_id": "c1", "name": "fn", "result": map[string]any{"ok": true}},
+				map[string]any{"type": "user_input", "content": []any{imgBlock}},
+			},
+		},
+		{
+			name:     "single function_result step map appends user_input step after function_result",
+			existing: map[string]any{"type": "function_result", "call_id": "c1", "name": "fn", "result": map[string]any{"ok": true}},
+			want: []any{
+				map[string]any{"type": "function_result", "call_id": "c1", "name": "fn", "result": map[string]any{"ok": true}},
+				map[string]any{"type": "user_input", "content": []any{imgBlock}},
+			},
+		},
+	}
+
+	for _, tc := range successCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := mergeMediaBlocksIntoInput(media, tc.existing)
+			if err != nil {
+				t.Fatalf("mergeMediaBlocksIntoInput(%v) unexpected error: %v", tc.existing, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("mergeMediaBlocksIntoInput(%v) = %#v, want %#v", tc.existing, got, tc.want)
+			}
+		})
+	}
+
+	errorCases := []struct {
+		name     string
+		existing any
+		wantSub  string
+	}{
+		{
+			name:     "primitive number existing",
+			existing: 42,
+			wantSub:  "non-content input",
+		},
+		{
+			name:     "non-user_input step map",
+			existing: map[string]any{"type": "model_output", "content": []any{txtBlock}},
+			wantSub:  `cannot combine --input with "model_output" step`,
+		},
+		{
+			name:     "untyped object map",
+			existing: map[string]any{"foo": "bar"},
+			wantSub:  "unrecognized input object",
+		},
+		{
+			name:     "non-object in array",
+			existing: []any{"bad"},
+			wantSub:  "non-object element",
+		},
+		{
+			name:     "untyped object in array",
+			existing: []any{map[string]any{"foo": "bar"}},
+			wantSub:  "unrecognized element",
+		},
+		{
+			name: "mixed step and content array",
+			existing: []any{
+				map[string]any{"type": "user_input", "content": []any{txtBlock}},
+				txtBlock,
+			},
+			wantSub: "mixes step objects and bare content blocks",
+		},
+		{
+			name: "step array without user_input",
+			existing: []any{
+				map[string]any{"type": "model_output", "content": []any{txtBlock}},
+			},
+			wantSub: `do not contain a "user_input" step`,
+		},
+		{
+			name: "step array with consecutive user_input steps",
+			existing: []any{
+				map[string]any{"type": "user_input", "content": []any{txtBlock}},
+				map[string]any{"type": "user_input", "content": []any{txtBlock}},
+			},
+			wantSub: `multiple consecutive "user_input" steps`,
+		},
+		{
+			name: "step array where user_input is not final step",
+			existing: []any{
+				map[string]any{"type": "user_input", "content": []any{txtBlock}},
+				map[string]any{"type": "model_output", "content": []any{txtBlock}},
+			},
+			wantSub: `"user_input" is not the final step`,
+		},
+		{
+			name:     "user_input step with invalid content object",
+			existing: map[string]any{"type": "user_input", "content": map[string]any{"type": "model_output"}},
+			wantSub:  `non-content object in "user_input" step content`,
+		},
+		{
+			name:     "user_input step with invalid content array element",
+			existing: map[string]any{"type": "user_input", "content": []any{"bad"}},
+			wantSub:  `non-content element in "user_input" step content`,
+		},
+		{
+			name:     "user_input step with invalid content primitive",
+			existing: map[string]any{"type": "user_input", "content": 123},
+			wantSub:  `non-content "content" in "user_input" step`,
+		},
+	}
+
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rawErr := func() error {
+				_, err := mergeMediaBlocksIntoInput(media, tc.existing)
+				return err
+			}()
+			if rawErr == nil || !strings.Contains(rawErr.Error(), tc.wantSub) {
+				t.Fatalf("mergeMediaBlocksIntoInput(%v) error = %v, want substring %q", tc.existing, rawErr, tc.wantSub)
+			}
+			root, _, _ := newTestEnvironmentFilesRoot("http://127.0.0.1:0")
+			err := output.CLIError(root, rawErr)
+			if got := clierrors.ExitCode(err); got != clierrors.ExitUsage {
+				t.Errorf("ExitCode = %d, want %d (ExitUsage)", got, clierrors.ExitUsage)
+			}
+		})
+	}
+}
+
+func TestTTSVoicePrompt(t *testing.T) {
+	pcmSamples := []byte{0x01, 0x02, 0x03, 0x04}
+	pcmB64 := base64.StdEncoding.EncodeToString(pcmSamples)
+
+	var (
+		lastVoiceBody       map[string]any
+		lastInteractionBody map[string]any
+		deletedVoiceID      string
+		failInteraction     bool
+		failDelete          bool
+		returnKeyOnly       bool
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta/voices":
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &lastVoiceBody)
+			idField := `"id":"voice_custom1"`
+			if returnKeyOnly {
+				idField = `"key":"voicekey_custom1"`
+			}
+			_, _ = w.Write([]byte(`{` + idField + `,"type":"prompted"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1beta/voices/voice_custom1":
+			if failDelete {
+				http.Error(w, `{"error":{"message":"delete failed"}}`, http.StatusInternalServerError)
+				return
+			}
+			deletedVoiceID = "voice_custom1"
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta/interactions":
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &lastInteractionBody)
+			if failInteraction {
+				http.Error(w, `{"error":{"message":"synthesis failed"}}`, http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"int_tts1","status":"completed","steps":[{"type":"model_output","content":[{"type":"audio","data":"` + pcmB64 + `","mime_type":"audio/l16","sample_rate":24000,"channels":1}]}]}`))
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	newRoot := func(args ...string) (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
+		root, stdout, stderr := newTestEnvironmentFilesRoot(srv.URL)
+		root.PersistentFlags().Bool("no-retries", true, "")
+		ttsCmd := &cobra.Command{Use: "tts"}
+		attachTTS(ttsCmd)
+		root.AddCommand(ttsCmd)
+		output.PreparseRenderingFlags(root, args)
+		root.SetArgs(args)
+		return root, stdout, stderr
+	}
+
+	existingFile := filepath.Join(t.TempDir(), "not_a_dir")
+	if err := os.WriteFile(existingFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flag validation errors on `tts --voice-prompt`.
+	for name, tc := range map[string]struct {
+		args    []string
+		wantErr string
+	}{
+		"blank voice-prompt": {
+			args:    []string{"tts", "Hello", "--voice-prompt", "   "},
+			wantErr: "--voice-prompt cannot be empty",
+		},
+		"voice and voice-prompt conflict": {
+			args:    []string{"tts", "Hello", "--voice-prompt", "warm", "--voice", "Puck"},
+			wantErr: "mutually exclusive",
+		},
+		"multi-speaker and voice-prompt conflict": {
+			args:    []string{"tts", "Alice: hi. Bob: yo.", "--voice-prompt", "warm", "--multi-speaker", "Alice=Kore,Bob=Puck"},
+			wantErr: "mutually exclusive",
+		},
+		"invalid --out parent fails before network calls": {
+			args:    []string{"tts", "Hello", "--voice-prompt", "warm", "--out", filepath.Join(existingFile, "out.wav")},
+			wantErr: "is not a directory",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lastVoiceBody = nil
+			root, _, _ := newRoot(tc.args...)
+			rawErr := root.Execute()
+			if rawErr == nil || !strings.Contains(rawErr.Error(), tc.wantErr) {
+				t.Fatalf("Execute(%v) err = %v, want substring %q", tc.args, rawErr, tc.wantErr)
+			}
+			if got := clierrors.ExitCode(output.CLIError(root, rawErr)); got != clierrors.ExitUsage {
+				t.Errorf("ExitCode = %d, want %d (ExitUsage)", got, clierrors.ExitUsage)
+			}
+			if lastVoiceBody != nil {
+				t.Errorf("expected no CreateVoice network call on validation error, got %+v", lastVoiceBody)
+			}
+		})
+	}
+
+	t.Run("tts --voice-prompt trims prompt and style and synthesizes WAV", func(t *testing.T) {
+		outWav := filepath.Join(t.TempDir(), "out.wav")
+		lastVoiceBody = nil
+		lastInteractionBody = nil
+		root, stdout, _ := newRoot("tts", "Hello world.", "--voice-prompt", "  A warm British voice  ", "--language", "en-GB", "--style", "  cheerfully  ", "--out", outWav)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("Execute tts --voice-prompt: %v", err)
+		}
+		if lastVoiceBody["store"] != true {
+			t.Errorf("store = %v, want true", lastVoiceBody["store"])
+		}
+		voiceObj, _ := lastVoiceBody["voice"].(map[string]any)
+		if _, hasModel := voiceObj["model"]; hasModel {
+			t.Errorf("voice.model = %v, want omitted so server selects default voice design model", voiceObj["model"])
+		}
+		promptedObj, _ := voiceObj["prompted"].(map[string]any)
+		if got := promptedObj["input"]; got != "A warm British voice" {
+			t.Errorf("voice.prompted.input = %q, want trimmed %q", got, "A warm British voice")
+		}
+		if got := voiceObj["language_code"]; got != "en-GB" {
+			t.Errorf("voice.language_code = %q, want en-GB", got)
+		}
+		genCfg, _ := lastInteractionBody["generation_config"].(map[string]any)
+		speechArr, _ := genCfg["speech_config"].([]any)
+		if len(speechArr) != 1 || speechArr[0].(map[string]any)["voice"] != "voice_custom1" {
+			t.Errorf("speech_config = %+v, want voice_custom1", genCfg["speech_config"])
+		}
+		steps, _ := lastInteractionBody["input"].([]any)
+		if len(steps) != 1 {
+			t.Fatalf("input steps = %+v, want 1 user_input step", steps)
+		}
+		contents, _ := steps[0].(map[string]any)["content"].([]any)
+		if len(contents) != 1 {
+			t.Fatalf("step content = %+v, want 1 text block", contents)
+		}
+		ann, _ := contents[0].(map[string]any)["annotations"].([]any)
+		if len(ann) != 1 || ann[0].(map[string]any)["style"] != "cheerfully" {
+			t.Errorf("input annotations = %+v, want trimmed style cheerfully", ann)
+		}
+		written, err := os.ReadFile(outWav)
+		if err != nil || !bytes.HasPrefix(written, []byte("RIFF")) {
+			t.Fatalf("outWav read err=%v, prefix=%q; want RIFF WAV", err, written)
+		}
+		if strings.TrimSpace(stdout.String()) != outWav {
+			t.Errorf("stdout = %q, want %q", stdout.String(), outWav)
+		}
+	})
+
+	t.Run("tts --voice-prompt deletes created voice on synthesis failure", func(t *testing.T) {
+		failInteraction = true
+		deletedVoiceID = ""
+		defer func() {
+			failInteraction = false
+		}()
+		rootFail, _, _ := newRoot("tts", "Hello world.", "--voice-prompt", "Warm voice", "--out", filepath.Join(t.TempDir(), "fail.wav"))
+		if err := rootFail.Execute(); err == nil {
+			t.Fatal("expected tts --voice-prompt to fail when interaction returns 500")
+		}
+		if deletedVoiceID != "voice_custom1" {
+			t.Errorf("deletedVoiceID after failed tts synthesis = %q, want voice_custom1", deletedVoiceID)
+		}
+	})
+
+	t.Run("tts --voice-prompt warns when cleanup delete fails", func(t *testing.T) {
+		failInteraction = true
+		failDelete = true
+		deletedVoiceID = ""
+		defer func() {
+			failInteraction = false
+			failDelete = false
+		}()
+		rootFail, _, stderr := newRoot("tts", "Hello world.", "--voice-prompt", "Warm voice", "--out", filepath.Join(t.TempDir(), "fail2.wav"))
+		if err := rootFail.Execute(); err == nil {
+			t.Fatal("expected tts --voice-prompt to fail when interaction returns 500")
+		}
+		if !strings.Contains(stderr.String(), "gemini-api voices delete voice_custom1") {
+			t.Errorf("stderr = %q, want cleanup warning with 'gemini-api voices delete voice_custom1'", stderr.String())
+		}
+	})
+
+	t.Run("tts --voice-prompt rejects response without voice id", func(t *testing.T) {
+		returnKeyOnly = true
+		deletedVoiceID = ""
+		defer func() {
+			returnKeyOnly = false
+		}()
+		rootKey, _, _ := newRoot("tts", "Hello world.", "--voice-prompt", "Warm voice", "--out", filepath.Join(t.TempDir(), "key.wav"))
+		err := rootKey.Execute()
+		if err == nil || !strings.Contains(err.Error(), "did not include a voice id") {
+			t.Fatalf("Execute err = %v, want 'did not include a voice id'", err)
+		}
+		if deletedVoiceID != "" {
+			t.Errorf("deletedVoiceID = %q, want empty when no id was returned", deletedVoiceID)
+		}
+	})
+}
+
+func TestCreateEnvironmentRequestEnv(t *testing.T) {
+	cred := "credentials/cred_123"
+	req := &environments.CreateEnvironmentRequest{
+		Env: map[string]environments.Env{
+			"PLAIN_VAR":  environments.CreateEnvStr("hello"),
+			"SECRET_VAR": environments.CreateEnvEnvVar(interactions.EnvVar{Credential: &cred}),
+		},
+	}
+
+	if got := req.GetEnv(); len(got) != 2 {
+		t.Errorf("GetEnv() len = %d, want 2", len(got))
+	}
+	var nilReq *environments.CreateEnvironmentRequest
+	if got := nilReq.GetEnv(); got != nil {
+		t.Errorf("nil CreateEnvironmentRequest.GetEnv() = %#v, want nil", got)
+	}
+
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("json.Marshal(CreateEnvironmentRequest) failed: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(raw map) failed: %v", err)
+	}
+	wantEnv := map[string]any{
+		"PLAIN_VAR":  "hello",
+		"SECRET_VAR": map[string]any{"credential": cred},
+	}
+	if !reflect.DeepEqual(decoded["env"], wantEnv) {
+		t.Errorf("marshaled env = %#v, want %#v", decoded["env"], wantEnv)
+	}
+
+	var roundTrip environments.CreateEnvironmentRequest
+	if err := json.Unmarshal(raw, &roundTrip); err != nil {
+		t.Fatalf("json.Unmarshal(CreateEnvironmentRequest) failed: %v", err)
+	}
+	if got := roundTrip.GetEnv()["PLAIN_VAR"]; got.Type != environments.EnvTypeStr || got.Str == nil || *got.Str != "hello" {
+		t.Errorf("round-tripped PLAIN_VAR = %#v, want string \"hello\"", got)
+	}
+	if got := roundTrip.GetEnv()["SECRET_VAR"]; got.Type != environments.EnvTypeEnvVar || got.EnvVar == nil || got.EnvVar.Credential == nil || *got.EnvVar.Credential != cred {
+		t.Errorf("round-tripped SECRET_VAR = %#v, want credential %q", got, cred)
+	}
+
+	if _, err := json.Marshal(environments.Env{}); err == nil {
+		t.Error("json.Marshal(empty Env) succeeded, want error")
+	}
+	var invalid environments.Env
+	if err := json.Unmarshal([]byte(`123`), &invalid); err == nil {
+		t.Error("json.Unmarshal(123 into Env) succeeded, want error")
 	}
 }

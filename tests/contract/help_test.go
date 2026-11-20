@@ -46,6 +46,7 @@ func TestHelpBudgetAndFooter(t *testing.T) {
 		{"tts"}, {"analyze"}, {"transcribe"},
 		{"agent"}, {"agent", "run"}, {"agent", "status"},
 		{"models"}, {"models", "list"}, {"files"}, {"files", "upload"},
+		{"voices"}, {"voices", "create"}, {"voices", "list"}, {"voices", "get"}, {"voices", "delete"},
 	}
 	for _, args := range commands {
 		name := strings.Join(args, " ")
@@ -83,21 +84,21 @@ func TestHelpDefaultsAndEscalation(t *testing.T) {
 		{[]string{"generate"}, []string{
 			"Just works:",
 			"Explain concurrency in one sentence",
-			"Defaults: model gemini-3.8-flash · streams the reply (--stream=false for one result)",
-			"Learn: https://ai.google.dev/gemini-api/docs/text-generation · escalate: full request control via gemini-api agent run",
+			"Defaults: model gemini-4-hydrogen · streams the reply (--stream=false for one result)",
+			"Learn: https://aistudio.google.com/docs/text-generation · escalate: full request control via gemini-api agent run",
 		}},
 		{[]string{"image"}, []string{
 			"Defaults: model gemini-nano-banana-2.1 · output ./gemini-image-{timestamp}-{rand}.{ext}",
-			"Learn: https://ai.google.dev/gemini-api/docs/image-generation · escalate: full request control via gemini-api agent run",
+			"Learn: https://aistudio.google.com/docs/image-generation · escalate: full request control via gemini-api agent run",
 		}},
 		{[]string{"tts"}, []string{
 			"Just works:\n  gemini-api tts \"Welcome to the show\"",
 			"Defaults: model gemini-3.8-flash-tts · voice Kore · 24kHz mono WAV",
-			"Learn: https://ai.google.dev/gemini-api/docs/speech-generation · escalate: full request control via gemini-api agent run",
+			"Learn: https://aistudio.google.com/docs/speech-generation · escalate: full request control via gemini-api agent run",
 		}},
 		{[]string{"files", "upload"}, []string{
 			"Defaults: MIME type detected from the extension",
-			"Learn: https://ai.google.dev/gemini-api/docs/files · escalate: metadata-only registration via gemini-api files register",
+			"Learn: https://aistudio.google.com/docs/files · escalate: metadata-only registration via gemini-api files register",
 		}},
 	}
 	for _, tc := range cases {
@@ -210,7 +211,7 @@ func TestPorcelainHelpCopy(t *testing.T) {
 	}
 	// The identifier is required once, as an argument or a flag: the flag alone
 	// must not claim to be required next to a "[file]" usage line.
-	for _, args := range [][]string{{"files", "get"}, {"files", "delete"}, {"models", "get"}} {
+	for _, args := range [][]string{{"files", "get"}, {"files", "delete"}, {"models", "get"}, {"voices", "get"}, {"voices", "delete"}} {
 		name := strings.Join(args, " ")
 		t.Run(name+" flag is not marked required", func(t *testing.T) {
 			result := runCLI(t, t.TempDir(), nil, append(args, "--help")...)
@@ -223,8 +224,8 @@ func TestPorcelainHelpCopy(t *testing.T) {
 	// worded as this CLI's behavior rather than a service rule.
 	for name, wants := range map[string][]string{
 		"analyze":      {"this CLI keeps each request under 20 MB", "gemini-api files upload"},
-		"transcribe":   {"this CLI keeps each request under 20 MB", "alias: captions", "one input only"},
-		"tts":          {"--out foo.mp3 is written as foo.wav", "An existing file is replaced", "gemini-tts-<unix-ms>-<random>"},
+		"transcribe":   {"this CLI keeps each request under 20 MB", "alias: captions", "one input only", "(video: gemini-4-hydrogen)"},
+		"tts":          {"--out foo.mp3 is written as foo.wav", "--out naming a directory places a default-named file inside it", "an existing file is replaced", "gemini-tts-<unix-ms>-<random>"},
 		"files upload": {"2 GB per file", "(default 5m)", "<path>"},
 	} {
 		t.Run(name+" disclosures", func(t *testing.T) {
@@ -247,7 +248,7 @@ func TestPorcelainHelpCopy(t *testing.T) {
 // not read the OS keychain). Keychain-sourced credentials are covered in
 // internal/cli/custom.
 func TestRootHelpMissingCredentialHint(t *testing.T) {
-	const hint = "No API key found. See https://ai.google.dev/gemini-api/docs/api-key for how to create one in Google AI Studio\n" +
+	const hint = "No API key found. See https://aistudio.google.com/docs/api-key for how to create one in Google AI Studio\n" +
 		"AI agents: an API key must be created manually by the user in Google AI Studio. Stop and ask the user to create one and run \"gemini-api configure\" or set GEMINI_API_KEY; do not run configure yourself or retry until they confirm it is set"
 	noKeyring := map[string]string{"GEMINI_NO_KEYRING": "true"}
 	withConfig := func(security string) func(*testing.T) string {

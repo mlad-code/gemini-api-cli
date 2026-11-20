@@ -228,6 +228,10 @@ type CreateModelInteraction struct {
 	//
 	// Deprecated: This will be removed in a future release, please migrate away from it as soon as possible.
 	CachedContent *string `json:"cached_content,omitzero"`
+	// Opaque token to resume a long decode. Output: set when status is
+	// REQUIRES_CONTINUATION and decoding can be resumed. Input: pass the latest
+	// token back unchanged in CreateInteraction to continue decoding.
+	ContinuationToken *string `json:"continuation_token,omitzero"`
 	// The environment configuration for the interaction. Can be an object
 	// specifying remote environment sources or a string referencing an existing
 	// environment ID.
@@ -243,8 +247,8 @@ type CreateModelInteraction struct {
 	// characters, underscores, and dashes. International characters are allowed.
 	// Label values are optional. Label keys must start with a letter.
 	Labels map[string]string `json:"labels,omitzero"`
-	// The model that will complete your prompt.\n\nSee [models](https://ai.google.dev/gemini-api/docs/models) for additional details.
-	Model *Model `default:"gemini-3.8-flash" json:"model"`
+	// The model that will complete your prompt.\n\nSee [models](https://aistudio.google.com/docs/models) for additional details.
+	Model *Model `default:"gemini-4-hydrogen" json:"model"`
 	// The ID of the previous interaction, if any.
 	PreviousInteractionID *string `json:"previous_interaction_id,omitzero"`
 	// Enforces that the generated response is a JSON object that complies with
@@ -296,6 +300,13 @@ func (c *CreateModelInteraction) GetCachedContent() *string {
 		return nil
 	}
 	return c.CachedContent
+}
+
+func (c *CreateModelInteraction) GetContinuationToken() *string {
+	if c == nil {
+		return nil
+	}
+	return c.ContinuationToken
 }
 
 func (c *CreateModelInteraction) GetEnvironment() *CreateModelInteractionEnvironment {

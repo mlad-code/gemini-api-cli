@@ -74,8 +74,11 @@ func newModelsCatalogCmd() *cobra.Command {
 				{"value": "gemini-3.5-flash", "description": "Gemini 3.5 Flash - Our earlier Flash model, built for speed and foundational performance across routine, high-throughput workloads.", "default": false, "group": "Gemini"},
 				{"value": "gemini-3.6-flash", "description": "Gemini 3.6 Flash - Our previous generation Flash model, balancing speed and multimodal capabilities across general agentic and everyday tasks.", "default": false, "group": "Gemini"},
 				{"value": "gemini-3.7-flash", "description": "Gemini 3.7 Flash - Our high-speed, efficient Flash model built for everyday coding, agentic tool use, and reliable multi-step execution.", "default": false, "group": "Gemini"},
-				{"value": "gemini-3.8-flash", "description": "Gemini 3.8 Flash - Our most intelligent Flash model, engineered for long-horizon software engineering, autonomous agents, and complex enterprise workflows.", "default": true, "group": "Gemini"},
+				{"value": "gemini-3.8-flash", "description": "Gemini 3.8 Flash - Our most intelligent Flash model, engineered for long-horizon software engineering, autonomous agents, and complex enterprise workflows.", "default": false, "group": "Gemini"},
 				{"value": "gemini-4-argon", "description": "Gemini 4 Argon - Our new frontier model, built to solve the hardest problems with depth and precision across real-world software engineering and knowledge work.", "default": false, "group": "Gemini"},
+				{"value": "gemini-4-carbon", "description": "Gemini 4 Carbon - Our most capable reasoning model, built for sustained agentic coding, multimodal knowledge work, scientific discovery, and cybersecurity defense.", "default": false, "group": "Gemini"},
+				{"value": "gemini-4-hydrogen", "description": "Gemini 4 Hydrogen - A model with frontier-level intelligence, built for fast, dependable execution across coding, agentic workflows, and multimodal knowledge work.", "default": true, "group": "Gemini"},
+				{"value": "gemini-4-neon", "description": "Gemini 4 Neon - Frontier-level intelligence with fast end-to-end task completion across complex software engineering, analytical, and science workflows.", "default": false, "group": "Gemini"},
 				{"value": "gemini-2.5-flash-image", "description": "Our native image generation model, optimized for speed, flexibility, and contextual understanding. Text input and output is priced the same as 2.5 Flash.", "default": false, "group": "Image"},
 				{"value": "gemini-3.1-flash-lite-image", "description": "Gemini 3.1 Flash Lite Image.", "default": false, "group": "Image"},
 				{"value": "gemini-3-pro-image", "description": "Gemini 3 Pro Image", "default": false, "group": "Image"},
@@ -85,12 +88,14 @@ func newModelsCatalogCmd() *cobra.Command {
 				{"value": "gemini-3.1-flash-tts-preview", "description": "Gemini 3.1 Flash TTS: Powerful, low-latency speech generation. Enjoy natural outputs, steerable prompts, and new expressive audio tags for precise narration control.", "default": false, "group": "Speech"},
 				{"value": "gemini-3.8-flash-tts", "description": "Gemini 3.8 Flash TTS - Flagship TTS model for Voice Design and dual-speaker screenplay control. Prompt custom vocal personas, direct line-by-line delivery, and add vocal bursts.", "default": false, "group": "Speech"},
 				{"value": "gemini-3.8-flash-lite-tts", "description": "Gemini 3.8 Flash Lite TTS - High-speed and cost-efficient, ideal for rapid dubbing, media localization, and high-throughput voice agents. Direct replacement for gemini-3.1-flash-tts-preview.", "default": false, "group": "Speech"},
+				{"value": "gemini-3.5-transcribe", "description": "Gemini 3.5 Transcribe - Low-latency speech-to-text model with utterance-based language detection, speaker diarization, word-level timestamps, and custom vocabulary biasing.", "default": false, "group": "Speech"},
 				{"value": "lyria-3-clip-preview", "description": "Our low-latency, music generation model optimized for high-fidelity audio clips and precise rhythmic control.", "default": false, "group": "Music"},
 				{"value": "lyria-3-pro-preview", "description": "Our advanced, full-song generative model with deep compositional understanding, optimized for precise structural control and complex transitions across diverse musical styles.", "default": false, "group": "Music"},
 				{"value": "lyria-3.5", "description": "Our flagship music generation model, optimized for full-length songs with complex structural coherence.", "default": false, "default_for": []string{"music"}, "group": "Music"},
 				{"value": "gemini-robotics-er-1.6-preview", "description": "Gemini Robotics-ER 1.6 Preview", "default": false, "group": "Robotics"},
 				{"value": "gemini-robotics-er-2-preview", "description": "Gemini Robotics Embodied Reasoning 2 Preview", "default": false, "group": "Robotics"},
-				{"value": "gemini-omni-1.1-flash", "description": "Our high-performance multimodal model designed for fast, conversational video generation, editing, and cinematic control.", "default": false, "default_for": []string{"video"}, "group": "Video"},
+				{"value": "gemini-omni-1.2-flash", "description": "Gemini Omni 1.2 Flash - Our latest multimodal model for fast, conversational video generation, editing, and cinematic control.", "default": false, "default_for": []string{"video"}, "group": "Video"},
+				{"value": "gemini-omni-1.1-flash", "description": "Our high-performance multimodal model designed for fast, conversational video generation, editing, and cinematic control.", "default": false, "group": "Video"},
 				{"value": "gemini-omni-flash-preview", "description": "Preview release of our multimodal model for conversational video generation, editing, and cinematic control.", "default": false, "group": "Video"},
 			}
 			if output.IsMachineMode(cmd) {
@@ -116,8 +121,11 @@ func newModelsCatalogCmd() *cobra.Command {
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.5-flash", "Gemini 3.5 Flash - Our earlier Flash model, built for speed and foundational performance across routine, high-throughput workloads.")
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.6-flash", "Gemini 3.6 Flash - Our previous generation Flash model, balancing speed and multimodal capabilities across general agentic and everyday tasks.")
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.7-flash", "Gemini 3.7 Flash - Our high-speed, efficient Flash model built for everyday coding, agentic tool use, and reliable multi-step execution.")
-			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.8-flash (default)", "Gemini 3.8 Flash - Our most intelligent Flash model, engineered for long-horizon software engineering, autonomous agents, and complex enterprise workflows.")
+			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.8-flash", "Gemini 3.8 Flash - Our most intelligent Flash model, engineered for long-horizon software engineering, autonomous agents, and complex enterprise workflows.")
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-4-argon", "Gemini 4 Argon - Our new frontier model, built to solve the hardest problems with depth and precision across real-world software engineering and knowledge work.")
+			fmt.Fprintf(out, "  %-42s %s\n", "gemini-4-carbon", "Gemini 4 Carbon - Our most capable reasoning model, built for sustained agentic coding, multimodal knowledge work, scientific discovery, and cybersecurity defense.")
+			fmt.Fprintf(out, "  %-42s %s\n", "gemini-4-hydrogen (default)", "Gemini 4 Hydrogen - A model with frontier-level intelligence, built for fast, dependable execution across coding, agentic workflows, and multimodal knowledge work.")
+			fmt.Fprintf(out, "  %-42s %s\n", "gemini-4-neon", "Gemini 4 Neon - Frontier-level intelligence with fast end-to-end task completion across complex software engineering, analytical, and science workflows.")
 			fmt.Fprintln(out)
 			fmt.Fprintln(out, "Image:")
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-2.5-flash-image", "Our native image generation model, optimized for speed, flexibility, and contextual understanding. Text input and output is priced the same as 2.5 Flash.")
@@ -131,6 +139,7 @@ func newModelsCatalogCmd() *cobra.Command {
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.1-flash-tts-preview", "Gemini 3.1 Flash TTS: Powerful, low-latency speech generation. Enjoy natural outputs, steerable prompts, and new expressive audio tags for precise narration control.")
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.8-flash-tts", "Gemini 3.8 Flash TTS - Flagship TTS model for Voice Design and dual-speaker screenplay control. Prompt custom vocal personas, direct line-by-line delivery, and add vocal bursts.")
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.8-flash-lite-tts", "Gemini 3.8 Flash Lite TTS - High-speed and cost-efficient, ideal for rapid dubbing, media localization, and high-throughput voice agents. Direct replacement for gemini-3.1-flash-tts-preview.")
+			fmt.Fprintf(out, "  %-42s %s\n", "gemini-3.5-transcribe", "Gemini 3.5 Transcribe - Low-latency speech-to-text model with utterance-based language detection, speaker diarization, word-level timestamps, and custom vocabulary biasing.")
 			fmt.Fprintln(out)
 			fmt.Fprintln(out, "Music:")
 			fmt.Fprintf(out, "  %-42s %s\n", "lyria-3-clip-preview", "Our low-latency, music generation model optimized for high-fidelity audio clips and precise rhythmic control.")
@@ -142,7 +151,8 @@ func newModelsCatalogCmd() *cobra.Command {
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-robotics-er-2-preview", "Gemini Robotics Embodied Reasoning 2 Preview")
 			fmt.Fprintln(out)
 			fmt.Fprintln(out, "Video:")
-			fmt.Fprintf(out, "  %-42s %s\n", "gemini-omni-1.1-flash (default: video)", "Our high-performance multimodal model designed for fast, conversational video generation, editing, and cinematic control.")
+			fmt.Fprintf(out, "  %-42s %s\n", "gemini-omni-1.2-flash (default: video)", "Gemini Omni 1.2 Flash - Our latest multimodal model for fast, conversational video generation, editing, and cinematic control.")
+			fmt.Fprintf(out, "  %-42s %s\n", "gemini-omni-1.1-flash", "Our high-performance multimodal model designed for fast, conversational video generation, editing, and cinematic control.")
 			fmt.Fprintf(out, "  %-42s %s\n", "gemini-omni-flash-preview", "Preview release of our multimodal model for conversational video generation, editing, and cinematic control.")
 			return nil
 		},

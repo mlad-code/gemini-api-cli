@@ -129,7 +129,8 @@ func TestAnalyzeRemoteFilePorcelain(t *testing.T) {
 	}
 }
 
-// TestTranscribeSRTPorcelain: structured segments rendered to an SRT artifact.
+// TestTranscribeSRTPorcelain: a general model's structured segments rendered
+// to an SRT artifact.
 func TestTranscribeSRTPorcelain(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -143,7 +144,7 @@ func TestTranscribeSRTPorcelain(t *testing.T) {
 	os.WriteFile(audioPath, []byte("not really audio"), 0o644)
 	outPath := filepath.Join(dir, "out.srt")
 
-	args := append(plainArgs(server.URL), "transcribe", "--input", audioPath, "--format", "srt", "--out", outPath)
+	args := append(plainArgs(server.URL), "transcribe", "-m", "gemini-3.8-flash", "--input", audioPath, "--format", "srt", "--out", outPath)
 	result := runCLI(t, dir, nil, args...)
 	if result.err != nil {
 		t.Fatalf("transcribe failed: %v\nstderr: %s", result.err, result.stderr)
@@ -163,17 +164,18 @@ func TestTranscribeSRTPorcelain(t *testing.T) {
 // with a runtime error on FAILED, an unknown state, or the --wait-timeout.
 func TestFilesUploadWait(t *testing.T) {
 	cases := []struct {
-		name       string
-		states     []string // successive files.get states; the last one repeats
-		wantCode   int
-		wantStderr string
-		wantPolls  int32
+		name        string
+		states      []string // successive files.get states; the last one repeats
+		waitTimeout string
+		wantCode    int
+		wantStderr  string
+		wantPolls   int32
 	}{
-		{"processing then active", []string{"PROCESSING", "ACTIVE"}, 0, "files/xyz789 is ACTIVE", 2},
-		{"unspecified then active", []string{"STATE_UNSPECIFIED", "ACTIVE"}, 0, "files/xyz789 is ACTIVE", 2},
-		{"failed", []string{"FAILED"}, 1, "failed processing on the server", 1},
-		{"unknown state", []string{"SOMETHING_NEW"}, 1, "unexpected state SOMETHING_NEW", 1},
-		{"timeout", []string{"PROCESSING"}, 1, "did not become ACTIVE within 300ms", 2},
+		{"processing then active", []string{"PROCESSING", "ACTIVE"}, "5s", 0, "files/xyz789 is ACTIVE", 2},
+		{"unspecified then active", []string{"STATE_UNSPECIFIED", "ACTIVE"}, "5s", 0, "files/xyz789 is ACTIVE", 2},
+		{"failed", []string{"FAILED"}, "300ms", 1, "failed processing on the server", 1},
+		{"unknown state", []string{"SOMETHING_NEW"}, "300ms", 1, "unexpected state SOMETHING_NEW", 1},
+		{"timeout", []string{"PROCESSING"}, "300ms", 1, "did not become ACTIVE within 300ms", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,7 +200,7 @@ func TestFilesUploadWait(t *testing.T) {
 			dir := t.TempDir()
 			src := filepath.Join(dir, "clip.mp4")
 			os.WriteFile(src, []byte("some video bytes"), 0o644)
-			args := append(plainArgs(server.URL), "files", "upload", src, "--wait", "--wait-timeout", "300ms")
+			args := append(plainArgs(server.URL), "files", "upload", src, "--wait", "--wait-timeout", tc.waitTimeout)
 			result := runCLI(t, dir, nil, args...)
 			if code := exitCode(t, result); code != tc.wantCode {
 				t.Errorf("exit code = %d, want %d\nstderr: %s", code, tc.wantCode, result.stderr)
@@ -283,6 +285,44 @@ func TestFilesIdentifierForms(t *testing.T) {
 			}
 			if gotMethod != tt.wantMethod || gotPath != "/v1beta/files/abc" {
 				t.Errorf("request = %s %q, want %s /v1beta/files/abc", gotMethod, gotPath, tt.wantMethod)
+			}
+		})
+	}
+}
+
+// TestVoicesIdentifierForms: the generated voices get/delete accept the id as a
+// positional or via --id, bare or "voices/"-prefixed, and always send the bare
+// id as the path parameter.
+func TestVoicesIdentifierForms(t *testing.T) {
+	cases := []struct {
+		name       string
+		args       []string
+		wantMethod string
+	}{
+		{name: "get positional prefixed", args: []string{"voices", "get", "voices/voice_abc123"}, wantMethod: http.MethodGet},
+		{name: "get positional bare", args: []string{"voices", "get", "voice_abc123"}, wantMethod: http.MethodGet},
+		{name: "get flag prefixed", args: []string{"voices", "get", "--id", "voices/voice_abc123"}, wantMethod: http.MethodGet},
+		{name: "get flag bare", args: []string{"voices", "get", "--id", "voice_abc123"}, wantMethod: http.MethodGet},
+		{name: "delete positional prefixed", args: []string{"voices", "delete", "voices/voice_abc123"}, wantMethod: http.MethodDelete},
+		{name: "delete flag prefixed", args: []string{"voices", "delete", "--id", "voices/voice_abc123"}, wantMethod: http.MethodDelete},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotMethod, gotPath string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod, gotPath = r.Method, r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"id":"voice_abc123","type":"prompted"}`)
+			}))
+			defer server.Close()
+
+			args := append(baseArgs(server.URL), tt.args...)
+			result := runCLI(t, t.TempDir(), nil, args...)
+			if result.err != nil {
+				t.Fatalf("%s failed: %v\nstderr: %s", tt.name, result.err, result.stderr)
+			}
+			if gotMethod != tt.wantMethod || gotPath != "/v1beta/voices/voice_abc123" {
+				t.Errorf("request = %s %q, want %s /v1beta/voices/voice_abc123", gotMethod, gotPath, tt.wantMethod)
 			}
 		})
 	}

@@ -218,6 +218,9 @@ func TestADCServiceAccountScopesAndJWT(t *testing.T) {
 	if val != "ya29.sa-adc-token" || source != "adc" {
 		t.Fatalf("ResolveRequestSecurityCredential = (%q, %q), want (\"ya29.sa-adc-token\", \"adc\")", val, source)
 	}
+	if scrubbed := config.ScrubSecrets("Authorization: Bearer ya29.sa-adc-token"); scrubbed != "Authorization: Bearer [REDACTED]" {
+		t.Errorf("ScrubSecrets = %q, want %q", scrubbed, "Authorization: Bearer [REDACTED]")
+	}
 }
 
 func TestADCPrecedenceAndDryRun(t *testing.T) {
